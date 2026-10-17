@@ -1,4 +1,4 @@
--- WordChain Helper | v3.8 (Verify-before-send + mobile/iPad typing fix)
+-- WordChain Helper | v3.8 (Verify-before-send + mobile/iPad typing fix + IceOverlay Check)
 
 local Players       = game:GetService("Players")
 local TweenService  = game:GetService("TweenService")
@@ -19,7 +19,7 @@ local CFG = {
     TYPING_SPEED_MIN = 0.02,
     TYPING_SPEED_MAX = 0.12,
 
-    SUBMIT_DELAY         = 3,    -- รอกี่วินาทีหลังพิมพ์เสร็จก่อนส่ง (เดิม task.wait(3))
+    SUBMIT_DELAY         = 0.1,  -- แก้ไข: ไม่ต้องรอ 3 วิแล้ว กดส่งเกือบทันที (ใส่ 0.1 เผื่อเกมรับ Text ไม่ทัน)
     VERIFY_RETRIES       = 4,    -- ถ้าข้อความในช่องไม่ตรง ให้ลบแล้วพิมพ์ใหม่ได้สูงสุดกี่ครั้ง
     MOBILE_HIDE_KEYBOARD = true, -- มือถือ/ไอแพด: ไม่เปิดคีย์บอร์ดจริงตอนออโต้พิมพ์ (กัน IME ตีกับสคริปต์)
 
@@ -279,7 +279,6 @@ local function updateSpeedLabel()
 end
 updateSpeedLabel()
 
--- แถบเลื่อนปรับความเร็ว (Slider UI)
 local sliderBg = Instance.new("Frame", speedPopup)
 sliderBg.Size, sliderBg.BackgroundColor3 = UDim2.new(0, 130, 0, 8), Color3.fromHex("222222")
 Instance.new("UICorner", sliderBg).CornerRadius = UDim.new(1, 0)
@@ -310,14 +309,12 @@ UIS.InputChanged:Connect(function(input)
         local absSize = sliderBg.AbsoluteSize.X
         local alpha = math.clamp((mousePos - absPos) / absSize, 0, 1)
         
-        -- คำนวณค่า Delay ใหม่ (สลับด้าน: ซ้ายเร็ว ขวาช้า หรือ ซ้ายช้า ขวาเร็ว ตามชอบ เลือกให้ซ้ายเร็วขวาช้า)
         CURRENT_SPEED_DELAY = CFG.TYPING_SPEED_MIN + (alpha * (CFG.TYPING_SPEED_MAX - CFG.TYPING_SPEED_MIN))
         updateSliderPos(CURRENT_SPEED_DELAY)
         updateSpeedLabel()
     end
 end)
 
--- ฟังก์ชันเปิด/ปิด Popup ความเร็ว
 speedBtn.MouseButton1Click:Connect(function()
     speedPopup.Visible = not speedPopup.Visible
     updateSliderPos(CURRENT_SPEED_DELAY)
@@ -346,7 +343,6 @@ end
 local currentTypeCycle = 0
 local IS_TOUCH = UIS.TouchEnabled
 
--- หาช่องพิมพ์ของเกม + คำนำหน้าที่เกมแสดงไว้
 local function getInputBox()
     local gameUI = LP.PlayerGui:FindFirstChild("GameUI")
     local root   = gameUI and gameUI:FindFirstChild("Root")
@@ -361,7 +357,6 @@ local function getInputBox()
     return wBox, pText
 end
 
--- ส่งคำ: ทัช (มือถือ/ไอแพด) ใช้ ReleaseFocus(true) เพราะ VIM ส่ง Enter ไม่ค่อยติด / PC ใช้ Enter
 local function submitBox(wBox)
     if IS_TOUCH then
         local ok = pcall(function() wBox:ReleaseFocus(true) end)
@@ -372,8 +367,6 @@ local function submitBox(wBox)
     VIM:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
 end
 
--- ลบช่องแล้วพิมพ์ใหม่ ใช้ buffer ของเราเอง (ไม่อ่านกลับจาก wBox.Text ระหว่างพิมพ์
--- เพราะบนมือถือ IME อาจแก้ข้อความทำให้ตัวอักษรเพี้ยน/ซ้ำ)
 local function fillBox(wBox, text, instant, cancelled)
     wBox.Text = ""
     task.wait(0.1)
@@ -403,7 +396,6 @@ local function doAutoFill()
     local wBox, pText = getInputBox()
     if not wBox then return end
 
-    -- ส่วนที่ต้องพิมพ์จริง (ตัดคำนำหน้าที่เกมใส่ให้แล้วออก)
     local suffix = word
     if pText ~= "" and word:sub(1, #pText) == pText then
         suffix = word:sub(#pText + 1)
@@ -430,13 +422,12 @@ local function doAutoFill()
         pulse(badgeScale)
 
         local submitted = false
-        local waitBefore = CFG.SUBMIT_DELAY -- ครั้งแรกรอตามที่ตั้งไว้ รอบพิมพ์ใหม่รอสั้น ๆ
+        local waitBefore = CFG.SUBMIT_DELAY 
 
         for attempt = 1, CFG.VERIFY_RETRIES + 1 do
             if cancelled() then return end
             if attempt > 1 then autoHintChip.Text = "⟳ พิมพ์ใหม่ " .. (attempt - 1) end
 
-            -- รอบแรกพิมพ์ทีละตัวตาม Speed / รอบที่ลองใหม่ใส่ทั้งคำทีเดียว (ไม่ผ่าน IME ทีละตัว)
             if not fillBox(wBox, suffix, attempt > 1, cancelled) then return end
 
             task.wait(waitBefore)
@@ -445,8 +436,32 @@ local function doAutoFill()
 
             if not wBox:IsFocused() then wBox:CaptureFocus() end
 
-            -- เช็คก่อนส่ง: ข้อความในช่องต้องตรงกับคำที่แนะนำเป๊ะ ๆ
             if wBox.Text == suffix then
+                
+                -- ตรวจสอบน้ำแข็งก่อนส่งคำตอบ
+                while true do
+                    if cancelled() then return end
+                    
+                    local isFrozen = false
+                    pcall(function()
+                        local gameUI = LP.PlayerGui:FindFirstChild("GameUI")
+                        local root = gameUI and gameUI:FindFirstChild("Root")
+                        local ice = root and root:FindFirstChild("IceOverlay")
+                        
+                        if ice then
+                            local lbl = ice:FindFirstChild("TextLabel")
+                            if lbl and ice.Visible and lbl.Visible then
+                                isFrozen = true
+                            end
+                        end
+                    end)
+                    
+                    if not isFrozen then break end
+                    
+                    autoHintChip.Text = "❄️ ติดน้ำแข็ง รอส่ง..."
+                    task.wait(0.2)
+                end
+
                 submitBox(wBox)
                 submitted = true
                 break
@@ -460,7 +475,6 @@ local function doAutoFill()
     end)
     if not ok then warn("[WC_Helper] autofill error: " .. tostring(err)) end
 
-    -- คืนค่าที่ปรับไว้ชั่วคราว
     pcall(function()
         if oldClear ~= nil then wBox.ClearTextOnFocus = oldClear end
         if oldNative ~= nil then wBox.ShowNativeInput = oldNative end
