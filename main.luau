@@ -33,9 +33,51 @@ local CFG = {
     HISTORY_VISIBLE_ONLY = true,
     CLEAR_AFTER_EMPTY    = 8,
     LOG_STRIP_PREFIX     = true,
+
+    -- Typo simulation (สุ่มแกล้งพิมพ์ผิด)
+    TYPO_CHANCE_T1  = 22,   -- % โอกาสพิมพ์ผิด 1 ตัว เมื่อ TIER 1 (เวลาเยอะมาก)
+    TYPO_CHANCE_T2  = 10,   -- % เมื่อ TIER 2 (เวลาสบาย)
+    TYPO_NOTICE_LO  = 220,  -- ms ก่อนสังเกตว่าผิด
+    TYPO_NOTICE_HI  = 580,
+    TYPO_FIX_LO     = 80,   -- ms หลัง backspace ก่อนพิมพ์ต่อ
+    TYPO_FIX_HI     = 200,
+
+    -- Diacritic slow (สระ / วรรณยุกต์ / การันต์ พิมพ์ช้ากว่า)
+    DIACRITIC_MULT  = 1.85, -- ตัวคูณ delay ก่อนพิมพ์ตัวสระหรือวรรณยุกต์
 }
 
 local CURRENT_SPEED_DELAY = 0.05
+
+-- ════════════════════════════════════════════
+--  THAI DIACRITIC / TYPO TABLES
+-- ════════════════════════════════════════════
+
+-- สระและวรรณยุกต์ที่อยู่บน/ล่างพยัญชนะ — ต้องเอื้อมกดแป้นไกลกว่า → delay × DIACRITIC_MULT
+-- รวมถึง ์ (U+0E4C) ซึ่งคือ "การันต์" ที่ user พูดถึง
+local THAI_DIACRITICS = {}
+for _, cp in ipairs({
+    0x0E31, -- ั  sara a
+    0x0E34, -- ิ  sara i
+    0x0E35, -- ี  sara ii
+    0x0E36, -- ึ  sara ue
+    0x0E37, -- ื  sara uee
+    0x0E38, -- ุ  sara u
+    0x0E39, -- ู  sara uu
+    0x0E47, -- ็  mai taikhu
+    0x0E48, -- ่  mai ek
+    0x0E49, -- ้  mai tho
+    0x0E4A, -- ๊  mai tri
+    0x0E4B, -- ๋  mai chattawa
+    0x0E4C, -- ์  thanthakhat (การันต์)
+    0x0E4D, -- ํ  nikkhahit
+    0x0E4E, -- ๎  yamakkan
+}) do THAI_DIACRITICS[cp] = true end
+
+-- พยัญชนะสำหรับแกล้งพิมพ์ผิด (เลือกตัวที่ไม่ใช่ตัวจริง)
+local TYPO_POOL = {
+    "ก","ข","ค","ง","จ","ช","ด","ต","ท","น",
+    "บ","ป","พ","ม","ย","ร","ล","ว","ส","ห","อ",
+}
 
 local PATH_WHITELIST    = { "InputBar", "Match", "GameWord", "CurrentWord", "WordDisplay" }
 local PATH_BLACKLIST    = { "Menu", "Settings", "Lobby", "Profile", "Button", "Mode", "Code" }
@@ -1984,8 +2026,12 @@ local function submitBox(wBox)
 end
 
 local function fillBox(wBox, text, instant, cancelled)
-    local chars = {}
-    for _, c in utf8.codes(text) do chars[#chars + 1] = utf8.char(c) end
+    -- เก็บทั้ง char และ codepoint เพื่อ diacritic check
+    local chars, codepoints = {}, {}
+    for cp in utf8.codes(text) do
+        codepoints[#codepoints + 1] = cp
+        chars[#chars + 1] = utf8.char(cp)
+    end
     local n = #chars
 
     -- pre-check: ถ้าเวลาไม่พอแม้พิมพ์เร็วสุด → instant
@@ -1995,6 +2041,33 @@ local function fillBox(wBox, text, instant, cancelled)
             instant = true
         end
     end
+
+    -- ── Pre-decide typo position ──────────────────────────────────────
+    -- ทำได้แค่ first attempt (instant = false), คำต้องมีอย่างน้อย 3 ตัว
+    -- และตัวที่จะแกล้งพิมพ์ผิดต้องเป็นพยัญชนะ (ไม่ใช่สระ/วรรณยุกต์)
+    local typoAt = -1
+    if not instant and n >= 3 then
+        local t0 = getTimerValue()
+        local chance = 0
+        if t0 == math.huge or t0 > 8 then
+            chance = CFG.TYPO_CHANCE_T1
+        elseif t0 > 5 then
+            chance = CFG.TYPO_CHANCE_T2
+        end
+        if chance > 0 and math.random(100) <= chance then
+            -- เลือก position 2..n-1 ที่ตัวนั้นไม่ใช่ diacritic
+            local candidates = {}
+            for idx = 2, n - 1 do
+                if not THAI_DIACRITICS[codepoints[idx]] then
+                    candidates[#candidates + 1] = idx
+                end
+            end
+            if #candidates > 0 then
+                typoAt = candidates[math.random(#candidates)]
+            end
+        end
+    end
+    -- ─────────────────────────────────────────────────────────────────
 
     wBox.Text = ""
 
@@ -2019,6 +2092,34 @@ local function fillBox(wBox, text, instant, cancelled)
             buf = buf .. ch
             wBox.Text = buf
             if not IS_TOUCH then wBox.CursorPosition = #buf + 1 end
+
+            -- ── Typo injection ────────────────────────────────────────
+            if i == typoAt then
+                -- สุ่มตัวผิดจาก pool (ต้องไม่เท่ากับตัวจริง)
+                local wrongChar
+                repeat
+                    wrongChar = TYPO_POOL[math.random(#TYPO_POOL)]
+                until wrongChar ~= ch
+
+                -- พิมพ์ตัวผิดเพิ่มเข้าไป
+                local wrongBuf = buf .. wrongChar
+                wBox.Text = wrongBuf
+                if not IS_TOUCH then wBox.CursorPosition = #wrongBuf + 1 end
+
+                -- รอจนสังเกตว่าพิมพ์ผิด
+                task.wait(math.random(CFG.TYPO_NOTICE_LO, CFG.TYPO_NOTICE_HI) / 1000)
+                if cancelled() then return false end
+
+                -- ลบตัวผิด (backspace = revert กลับ buf เดิม)
+                wBox.Text = buf
+                if not IS_TOUCH then wBox.CursorPosition = #buf + 1 end
+
+                -- หยุดสั้นก่อนพิมพ์ต่อ
+                task.wait(math.random(CFG.TYPO_FIX_LO, CFG.TYPO_FIX_HI) / 1000)
+                if cancelled() then return false end
+            end
+            -- ─────────────────────────────────────────────────────────
+
             if i == n then break end
 
             -- อ่าน timer ทุก character
@@ -2035,16 +2136,17 @@ local function fillBox(wBox, text, instant, cancelled)
                 break
             end
 
-            -- เลือก delay ตาม profile
+            -- ── คำนวณ delay ตาม profile ──────────────────────────────
+            local delay
             local roll = math.random(100)
 
             if roll <= prof.burst then
                 -- burst: พิมพ์ติดกันเร็ว
-                task.wait(math.random(5, 25) / 1000)
+                delay = math.random(5, 25) / 1000
 
             elseif prof.pause > 0 and roll <= prof.burst + prof.pause then
                 -- micro-pause: หยุดคิดกลางคำ (TIER 1-2 เท่านั้น)
-                task.wait(math.random(180, 420) / 1000)
+                delay = math.random(180, 420) / 1000
 
             else
                 -- ความเร็วปกติของ tier นี้
@@ -2053,8 +2155,18 @@ local function fillBox(wBox, text, instant, cancelled)
                 local base = math.random(loMs, hiMs) / 1000
                 local jit  = math.random(prof.jlo, prof.jhi) / 1000
                 local slow = (prof.endSlow and i >= n - 1) and math.random(10, 40) / 1000 or 0
-                task.wait(math.max(0.010, base + jit + slow))
+                delay = math.max(0.010, base + jit + slow)
             end
+
+            -- ── Diacritic slow ────────────────────────────────────────
+            -- ตัวถัดไปเป็นสระ / วรรณยุกต์ / การันต์ → ต้องเอื้อมกดแป้นไกลกว่า
+            local nextCp = codepoints[i + 1]
+            if nextCp and THAI_DIACRITICS[nextCp] then
+                delay = delay * CFG.DIACRITIC_MULT
+            end
+            -- ─────────────────────────────────────────────────────────
+
+            task.wait(delay)
         end
     end
 
@@ -2513,4 +2625,3 @@ task.spawn(function()
         wasMyTurn = isMyTurn
     end
 end)
-
