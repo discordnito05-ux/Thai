@@ -2235,21 +2235,30 @@ local function sitIfNeeded()
 end
 
 task.spawn(function()
-    local gui     = PGui:WaitForChild("GameUI")
-    local root    = gui:WaitForChild("Root")
-    local banner  = root:WaitForChild("Banner")
-    local lbl     = banner:WaitForChild("TextLabel")
+    local gui    = PGui:WaitForChild("GameUI")
+    local root   = gui:WaitForChild("Root")
+    local banner = root:WaitForChild("Banner")
+    local lbl    = banner:WaitForChild("TextLabel")
 
-    lbl:GetPropertyChangedSignal("Text"):Connect(function()
+    local function onWin()
         local now = os.clock()
-        if lbl.Text:find("คุณชนะ", 1, true) and now - lastWinHandled > WIN_COOLDOWN then
-            lastWinHandled       = now
-            usedWords, usedCount = {}, 0
-            lastHistorySeen      = 0
-            currentSuggestions, currentIndex = {}, 1
-            showCurrent()
-            task.spawn(sitIfNeeded)
-        end
+        if not lbl.Text:find("คุณชนะ", 1, true) then return end
+        if now - lastWinHandled <= WIN_COOLDOWN then return end
+        lastWinHandled       = now
+        usedWords, usedCount = {}, 0
+        lastHistorySeen      = 0
+        currentSuggestions, currentIndex = {}, 1
+        showCurrent()
+        task.wait(0.5)
+        task.spawn(sitIfNeeded)
+    end
+
+    lbl:GetPropertyChangedSignal("Text"):Connect(onWin)
+
+    -- กัน case ที่ text set ก่อน visible → watch visible ด้วย
+    local watched = banner:IsA("GuiObject") and banner or lbl
+    watched:GetPropertyChangedSignal("Visible"):Connect(function()
+        if watched.Visible then onWin() end
     end)
 end)
 
@@ -2270,6 +2279,15 @@ task.spawn(function()
         task.wait(0.3)
         if not isTyping then doAutoFill() end
     end)
+end)
+
+-- ════════════════════════════════════════════
+--  ANTI AFK
+-- ════════════════════════════════════════════
+local VirtualUser = game:GetService("VirtualUser")
+LP.Idled:Connect(function()
+    VirtualUser:CaptureController()
+    VirtualUser:ClickButton2(Vector2.new())
 end)
 
 -- ════════════════════════════════════════════
