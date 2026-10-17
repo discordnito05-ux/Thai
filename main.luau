@@ -1876,6 +1876,100 @@ local function getInputBox()
 end
 
 -- ════════════════════════════════════════════
+--  LIVE TIMER READER
+-- ════════════════════════════════════════════
+local function getTimerValue()
+    local v = math.huge
+    pcall(function()
+        v = tonumber(
+            LP.PlayerGui
+                :FindFirstChild("GameUI")
+                :FindFirstChild("Root")
+                :FindFirstChild("Match")
+                :FindFirstChild("Timer")
+                :FindFirstChild("TextLabel")
+                .Text
+        ) or math.huge
+    end)
+    return v
+end
+
+-- ════════════════════════════════════════════
+--  TYPING PROFILE SELECTOR
+--  อ่าน timer ทุก character แล้วเลือก profile ที่เนียนที่สุด
+--  t         : วินาทีที่เหลือ (math.huge = ไม่มี timer)
+--  charsLeft : จำนวนตัวอักษรที่ยังไม่ได้พิมพ์ (รวม current)
+-- ════════════════════════════════════════════
+local function typingProfile(t, charsLeft)
+    local budget = (t - 0.38) / math.max(charsLeft, 1)
+
+    -- TIER 1: ผ่อนคลาย — human สมบูรณ์
+    if t == math.huge or t > 8 then
+        return {
+            instant = false,
+            burst   = 18,
+            pause   = 7,
+            lo      = CFG.TYPING_SPEED_MIN,
+            hi      = CFG.TYPING_SPEED_MAX,
+            jlo     = -35, jhi = 65,
+            endSlow = true,
+            hesLo   = 80,  hesHi = 160,
+        }
+    end
+
+    -- TIER 2: สบาย — เกือบเท่า TIER 1
+    if t > 5 then
+        local hi = math.min(CFG.TYPING_SPEED_MAX,
+            math.max(budget * 0.9, CFG.TYPING_SPEED_MIN + 0.012))
+        return {
+            instant = false,
+            burst   = 24,
+            pause   = 4,
+            lo      = CFG.TYPING_SPEED_MIN,
+            hi      = hi,
+            jlo     = -28, jhi = 50,
+            endSlow = true,
+            hesLo   = 55,  hesHi = 120,
+        }
+    end
+
+    -- TIER 3: กดดันกลาง — ตัด micro-pause, เร็วขึ้น
+    if t > 3 then
+        local hi = math.min(CFG.TYPING_SPEED_MAX * 0.65,
+            math.max(budget * 0.88, CFG.TYPING_SPEED_MIN + 0.010))
+        return {
+            instant = false,
+            burst   = 38,
+            pause   = 0,
+            lo      = CFG.TYPING_SPEED_MIN,
+            hi      = hi,
+            jlo     = -15, jhi = 28,
+            endSlow = false,
+            hesLo   = 15,  hesHi = 45,
+        }
+    end
+
+    -- TIER 4: กดดันสูง — burst dominant, jitter น้อย
+    if t > 1.2 then
+        local lo = math.max(0.010, budget * 0.75)
+        local hi = math.max(lo + 0.008, budget * 0.96)
+        return {
+            instant = hi < CFG.TYPING_SPEED_MIN,
+            burst   = 62,
+            pause   = 0,
+            lo      = lo,
+            hi      = hi,
+            jlo     = -5, jhi = 10,
+            endSlow = false,
+            hesLo   = 0,  hesHi = 10,
+        }
+    end
+
+    -- TIER 5: panic — instant
+    return { instant = true }
+end
+
+-- ════════════════════════════════════════════
 --  AUTOFILL SYSTEM  (identical to v3.8 logic)
 --  Only visual callbacks mapped to new UI refs
 -- ════════════════════════════════════════════
@@ -1890,21 +1984,80 @@ local function submitBox(wBox)
 end
 
 local function fillBox(wBox, text, instant, cancelled)
+    local chars = {}
+    for _, c in utf8.codes(text) do chars[#chars + 1] = utf8.char(c) end
+    local n = #chars
+
+    -- pre-check: ถ้าเวลาไม่พอแม้พิมพ์เร็วสุด → instant
+    if not instant then
+        local t0 = getTimerValue()
+        if t0 ~= math.huge and t0 < (n * 0.016 + 0.42) then
+            instant = true
+        end
+    end
+
     wBox.Text = ""
-    task.wait(0.1)
+
+    -- hesitation (อ่าน timer อีกครั้ง)
+    if not instant then
+        local prof0 = typingProfile(getTimerValue(), n)
+        if prof0.instant then
+            instant = true
+        elseif prof0.hesHi > 0 then
+            task.wait(math.random(prof0.hesLo, prof0.hesHi) / 1000)
+        end
+    end
     if cancelled() then return false end
+
     if instant then
         wBox.Text = text
     else
         local buf = ""
-        for _, c in utf8.codes(text) do
+        for i, ch in ipairs(chars) do
             if cancelled() then return false end
-            buf = buf .. utf8.char(c)
+
+            buf = buf .. ch
             wBox.Text = buf
             if not IS_TOUCH then wBox.CursorPosition = #buf + 1 end
-            task.wait(math.max(0.01, CURRENT_SPEED_DELAY + math.random(-10, 10) / 1000))
+            if i == n then break end
+
+            -- อ่าน timer ทุก character
+            local t    = getTimerValue()
+            local left = n - i
+            local prof = typingProfile(t, left)
+
+            -- ถ้า tier กลายเป็น instant กลางคำ → dump ส่วนที่เหลือทันที
+            if prof.instant then
+                local rest = ""
+                for j = i + 1, n do rest = rest .. chars[j] end
+                wBox.Text = buf .. rest
+                if not IS_TOUCH then wBox.CursorPosition = n + 1 end
+                break
+            end
+
+            -- เลือก delay ตาม profile
+            local roll = math.random(100)
+
+            if roll <= prof.burst then
+                -- burst: พิมพ์ติดกันเร็ว
+                task.wait(math.random(5, 25) / 1000)
+
+            elseif prof.pause > 0 and roll <= prof.burst + prof.pause then
+                -- micro-pause: หยุดคิดกลางคำ (TIER 1-2 เท่านั้น)
+                task.wait(math.random(180, 420) / 1000)
+
+            else
+                -- ความเร็วปกติของ tier นี้
+                local loMs = math.floor(prof.lo * 1000)
+                local hiMs = math.max(loMs + 1, math.floor(prof.hi * 1000))
+                local base = math.random(loMs, hiMs) / 1000
+                local jit  = math.random(prof.jlo, prof.jhi) / 1000
+                local slow = (prof.endSlow and i >= n - 1) and math.random(10, 40) / 1000 or 0
+                task.wait(math.max(0.010, base + jit + slow))
+            end
         end
     end
+
     wBox.CursorPosition = #wBox.Text + 1
     return true
 end
@@ -1981,6 +2134,7 @@ local function doAutoFill()
                         end
                     end)
                     if not isFrozen then break end
+                    if getTimerValue() <= 0.45 then break end
                     setStatus("❄️ ติดน้ำแข็ง รอส่ง...", COLORS.ice)
                     task.wait(0.2)
                 end
@@ -2008,7 +2162,28 @@ end
 local function checkAutoTrigger(targetWord)
     if not isAutoFillON or isTyping then return end
     task.spawn(function()
-        task.wait(math.random(4, 10) / 10)
+        local t = getTimerValue()
+        local base, extra
+
+        if t == math.huge or t > 6 then
+            -- เวลาเยอะ: reaction time ปกติของคน
+            base  = math.random(60, 180) / 100
+            extra = math.random(100) <= 25 and math.random(40, 120) / 100 or 0
+        elseif t > 3.5 then
+            -- กลาง: ตอบสนองเร็วขึ้นนิด
+            base  = math.random(30, 90) / 100
+            extra = math.random(100) <= 15 and math.random(10, 40) / 100 or 0
+        elseif t > 1.8 then
+            -- กดดัน: ไม่รอแล้ว
+            base  = math.random(6, 22) / 100
+            extra = 0
+        else
+            -- ตื่นตกใจ: ยิงทันที
+            base  = math.random(2, 8) / 100
+            extra = 0
+        end
+
+        task.wait(base + extra)
         if not isAutoFillON or isTyping then return end
         if lastWord ~= targetWord then return end
         doAutoFill()
@@ -2250,7 +2425,16 @@ task.spawn(function()
         currentSuggestions, currentIndex = {}, 1
         showCurrent()
         task.wait(0.5)
-        task.spawn(sitIfNeeded)
+        task.spawn(function()
+            -- กด W+S พร้อมกันสั้นๆ เพื่อ trigger seat
+            VIM:SendKeyEvent(true,  Enum.KeyCode.W, false, nil)
+            VIM:SendKeyEvent(true,  Enum.KeyCode.S, false, nil)
+            task.wait(0.3)
+            VIM:SendKeyEvent(false, Enum.KeyCode.W, false, nil)
+            VIM:SendKeyEvent(false, Enum.KeyCode.S, false, nil)
+            task.wait(0.1)
+            sitIfNeeded()
+        end)
     end
 
     lbl:GetPropertyChangedSignal("Text"):Connect(onWin)
@@ -2329,3 +2513,4 @@ task.spawn(function()
         wasMyTurn = isMyTurn
     end
 end)
+
