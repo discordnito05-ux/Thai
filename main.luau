@@ -1343,11 +1343,22 @@ end
 --  AUTO RANKED QUEUE
 -- ════════════════════════════════════════════
 local function clickGuiButton(button)
+    -- ยิง event โดยตรงบน instance ไม่ต้องพึ่ง screen position
+    local ok = pcall(function()
+        button:FireMouseButton1Click()
+    end)
+    if ok then return end
+
+    ok = pcall(function() firebutton(button) end)
+    if ok then return end
+
+    -- last resort: tap ตรงๆ ที่ตำแหน่งจริงของปุ่ม
     local pos = button.AbsolutePosition + button.AbsoluteSize * 0.5
-    VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, true,  game, 0)
+    VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 1)
     task.wait(0.07)
-    VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
+    VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 1)
 end
+
 
 local function tryQueueRanked()
     if not CFG.AUTO_RANK then return end
