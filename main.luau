@@ -1343,7 +1343,6 @@ end
 --  AUTO RANKED QUEUE
 -- ════════════════════════════════════════════
 local function clickGuiButton(button)
-    -- ยิง event โดยตรงบน instance ไม่ต้องพึ่ง screen position
     local ok = pcall(function()
         button:FireMouseButton1Click()
     end)
@@ -1352,23 +1351,21 @@ local function clickGuiButton(button)
     ok = pcall(function() firebutton(button) end)
     if ok then return end
 
-    -- last resort: tap ตรงๆ ที่ตำแหน่งจริงของปุ่ม
     local pos = button.AbsolutePosition + button.AbsoluteSize * 0.5
-    VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 1)
-    task.wait(0.07)
-    VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 1)
+    pcall(function()
+        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, true,  game, 1)
+        task.wait(0.05)
+        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 1)
+    end)
 end
-
 
 local function tryQueueRanked()
     if not CFG.AUTO_RANK then return end
     task.spawn(function()
         task.wait(CFG.RANK_QUEUE_DELAY)
 
-        -- หา TextButton ที่ visible และมีข้อความตรงกับ pattern
-        -- ครอบคลุมทั้ง button.Text และ TextLabel ลูก (รวม "TextLebal" typo)
-        local function findBtn(pattern, timeout)
-            local deadline = os.clock() + (timeout or 5)
+        local function findBtn(patterns, timeout)
+            local deadline = os.clock() + (timeout or 8)
             repeat
                 for _, obj in ipairs(LP.PlayerGui:GetDescendants()) do
                     if obj:IsA("TextButton") then
@@ -1381,10 +1378,15 @@ local function tryQueueRanked()
                             cur = cur.Parent
                         end
                         if visible then
-                            if obj.Text:find(pattern, 1, true) then return obj end
-                            for _, child in ipairs(obj:GetChildren()) do
-                                if child:IsA("TextLabel") or child:IsA("TextBox") then
-                                    if child.Text:find(pattern, 1, true) then return obj end
+                            local allText = obj.Text
+                            for _, desc in ipairs(obj:GetDescendants()) do
+                                if desc:IsA("TextLabel") or desc:IsA("TextBox") then
+                                    allText = allText .. desc.Text
+                                end
+                            end
+                            for _, pat in ipairs(patterns) do
+                                if allText:find(pat, 1, true) then
+                                    return obj
                                 end
                             end
                         end
@@ -1395,28 +1397,39 @@ local function tryQueueRanked()
             return nil
         end
 
-        -- Step 1: กดปุ่มแรงค์
-        local btn1 = findBtn("แรงค์", CFG.RANK_FIND_TIMEOUT)
+        local btn1 = findBtn({"แรงค์", "Ranked", "RANKED"}, CFG.RANK_FIND_TIMEOUT)
         if not btn1 then
-            warn("[WC_Helper] ไม่พบปุ่มแรงค์ใน PlayerGui")
+            warn("[WC_Helper] ไม่พบปุ่มแรงค์ — dump:")
+            for _, obj in ipairs(LP.PlayerGui:GetDescendants()) do
+                if obj:IsA("TextButton") then
+                    warn("  BTN: [" .. obj.Text .. "] @ " .. obj:GetFullName())
+                end
+            end
             return
         end
 
+        warn("[WC_Helper] พบปุ่มแรงค์: " .. btn1:GetFullName() .. " pos=" .. tostring(btn1.AbsolutePosition))
         island:Notify({ Title = "Auto Ranked", Message = "กำลังกด แรงค์...", Duration = 2 })
         clickGuiButton(btn1)
         task.wait(CFG.RANK_MODE_DELAY)
 
-        -- Step 2: เลือก 1v1 (ลอง pattern สองแบบ)
-        local btn2 = findBtn("1v1", 4) or findBtn("ดวลเดี่ยว", 4)
+        local btn2 = findBtn({"1v1", "ดวลเดี่ยว", "Solo", "SOLO"}, 6)
         if not btn2 then
-            warn("[WC_Helper] ไม่พบปุ่ม 1v1 / ดวลเดี่ยว")
+            warn("[WC_Helper] ไม่พบปุ่ม 1v1 — dump:")
+            for _, obj in ipairs(LP.PlayerGui:GetDescendants()) do
+                if obj:IsA("TextButton") and obj.Visible then
+                    warn("  BTN: [" .. obj.Text .. "] @ " .. obj:GetFullName())
+                end
+            end
             return
         end
 
-        island:Notify({ Title = "Auto Ranked", Message = "เลือก ดวลเดี่ยว 1v1...", Duration = 2 })
+        warn("[WC_Helper] พบปุ่ม 1v1: " .. btn2:GetFullName())
+        island:Notify({ Title = "Auto Ranked", Message = "เลือก 1v1...", Duration = 2 })
         clickGuiButton(btn2)
     end)
 end
+
 
 -- ════════════════════════════════════════════
 --  KEY BINDINGS
