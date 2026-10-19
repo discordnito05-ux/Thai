@@ -1353,59 +1353,56 @@ local function tryQueueRanked()
     if not CFG.AUTO_RANK then return end
     task.spawn(function()
         task.wait(CFG.RANK_QUEUE_DELAY)
-        local gui
-        local deadline = os.clock() + CFG.RANK_FIND_TIMEOUT
-        repeat
-            task.wait(0.3)
-            gui = LP.PlayerGui:FindFirstChild("RankedButton")
-        until gui or os.clock() >= deadline
 
-        if not gui then
-            warn("[WC_Helper] ไม่พบ RankedButton ใน PlayerGui")
+        -- หา TextButton ที่ visible และมีข้อความตรงกับ pattern
+        -- ครอบคลุมทั้ง button.Text และ TextLabel ลูก (รวม "TextLebal" typo)
+        local function findBtn(pattern, timeout)
+            local deadline = os.clock() + (timeout or 5)
+            repeat
+                for _, obj in ipairs(LP.PlayerGui:GetDescendants()) do
+                    if obj:IsA("TextButton") then
+                        local visible = true
+                        local cur = obj
+                        while cur and cur ~= LP.PlayerGui do
+                            if cur:IsA("GuiObject") and not cur.Visible then
+                                visible = false; break
+                            end
+                            cur = cur.Parent
+                        end
+                        if visible then
+                            if obj.Text:find(pattern, 1, true) then return obj end
+                            for _, child in ipairs(obj:GetChildren()) do
+                                if child:IsA("TextLabel") or child:IsA("TextBox") then
+                                    if child.Text:find(pattern, 1, true) then return obj end
+                                end
+                            end
+                        end
+                    end
+                end
+                task.wait(0.25)
+            until os.clock() >= deadline
+            return nil
+        end
+
+        -- Step 1: กดปุ่มแรงค์
+        local btn1 = findBtn("แรงค์", CFG.RANK_FIND_TIMEOUT)
+        if not btn1 then
+            warn("[WC_Helper] ไม่พบปุ่มแรงค์ใน PlayerGui")
             return
         end
 
-        local frame = gui:FindFirstChild("Frame")
-        if not frame then return end
-        local btn1 = frame:FindFirstChild("TextButton")
-        if not btn1 then return end
-        local lbl1 = btn1:FindFirstChild("TextLebal")
-        if not (lbl1 and lbl1.Text:find("เล่นแรงค์", 1, true)) then
-            warn("[WC_Helper] ไม่พบข้อความ 'เล่นแรงค์' บน btn1")
-            return
-        end
-
-        island:Notify({
-            Title   = "Auto Ranked",
-            Message = "กำลังกด เล่นแรงค์...",
-            Duration = 2,
-        })
-
+        island:Notify({ Title = "Auto Ranked", Message = "กำลังกด แรงค์...", Duration = 2 })
         clickGuiButton(btn1)
         task.wait(CFG.RANK_MODE_DELAY)
 
-        local f2, f3, btn2, lbl2
-        local deadline2 = os.clock() + 3
-        repeat
-            task.wait(0.2)
-            f2   = frame:FindFirstChild("Frame")
-            f3   = f2 and f2:FindFirstChild("Frame")
-            btn2 = f3 and f3:FindFirstChild("TextButton")
-            lbl2 = btn2 and btn2:FindFirstChild("TextLebal")
-        until (lbl2 and lbl2.Text:find("ดวลเดี่ยว 1v1", 1, true))
-            or os.clock() >= deadline2
-
-        if not (lbl2 and lbl2.Text:find("ดวลเดี่ยว 1v1", 1, true)) then
-            warn("[WC_Helper] ไม่พบปุ่ม 'ดวลเดี่ยว 1v1'")
+        -- Step 2: เลือก 1v1 (ลอง pattern สองแบบ)
+        local btn2 = findBtn("1v1", 4) or findBtn("ดวลเดี่ยว", 4)
+        if not btn2 then
+            warn("[WC_Helper] ไม่พบปุ่ม 1v1 / ดวลเดี่ยว")
             return
         end
 
-        island:Notify({
-            Title   = "Auto Ranked",
-            Message = "เลือก ดวลเดี่ยว 1v1...",
-            Duration = 2,
-        })
-
+        island:Notify({ Title = "Auto Ranked", Message = "เลือก ดวลเดี่ยว 1v1...", Duration = 2 })
         clickGuiButton(btn2)
     end)
 end
