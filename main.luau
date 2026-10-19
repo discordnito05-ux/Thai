@@ -18,9 +18,9 @@ local CFG = {
     MIN_LEN     = 1,
     MAX_LEN     = 40,
     MAX_SUGGEST = 30,
-    MIN_SUGGEST_CHARS = 6,
+    MIN_SUGGEST_CHARS = 5,
 
-    TYPING_SPEED_MIN = 0.02,
+    TYPING_SPEED_MIN = 0.017,
     TYPING_SPEED_MAX = 0.99,
 
     SUBMIT_DELAY         = 0.1,
