@@ -1,6 +1,9 @@
--- WordChain Helper | v4.0 (Dynamic Island UI)
--- GUI layer replaced with Apple Dynamic Island module.
--- All game logic (DB, scanning, autofill) is identical to v3.8.
+-- WordChain Helper | v4.1 (Auto Ranked Queue)
+-- Changes from v4.0:
+--   • isAutoFillON = true by default
+--   • TYPING_SPEED_MAX = 0.99, default delay 0.20
+--   • AUTO_RANK = true by default, toggle ได้
+--   • เพิ่ม AUTO_RANK system (กด ranked + 1v1 อัตโนมัติหลังชนะ)
 
 local Players       = game:GetService("Players")
 local TweenService  = game:GetService("TweenService")
@@ -18,7 +21,7 @@ local CFG = {
     MIN_SUGGEST_CHARS = 6,
 
     TYPING_SPEED_MIN = 0.02,
-    TYPING_SPEED_MAX = 0.12,
+    TYPING_SPEED_MAX = 0.99,
 
     SUBMIT_DELAY         = 0.1,
     VERIFY_RETRIES       = 4,
@@ -34,46 +37,33 @@ local CFG = {
     CLEAR_AFTER_EMPTY    = 8,
     LOG_STRIP_PREFIX     = true,
 
-    -- Typo simulation (สุ่มแกล้งพิมพ์ผิด)
-    TYPO_CHANCE_T1  = 22,   -- % โอกาสพิมพ์ผิด 1 ตัว เมื่อ TIER 1 (เวลาเยอะมาก)
-    TYPO_CHANCE_T2  = 10,   -- % เมื่อ TIER 2 (เวลาสบาย)
-    TYPO_NOTICE_LO  = 220,  -- ms ก่อนสังเกตว่าผิด
+    TYPO_CHANCE_T1  = 22,
+    TYPO_CHANCE_T2  = 10,
+    TYPO_NOTICE_LO  = 220,
     TYPO_NOTICE_HI  = 580,
-    TYPO_FIX_LO     = 80,   -- ms หลัง backspace ก่อนพิมพ์ต่อ
+    TYPO_FIX_LO     = 80,
     TYPO_FIX_HI     = 200,
 
-    -- Diacritic slow (สระ / วรรณยุกต์ / การันต์ พิมพ์ช้ากว่า)
-    DIACRITIC_MULT  = 1.85, -- ตัวคูณ delay ก่อนพิมพ์ตัวสระหรือวรรณยุกต์
+    DIACRITIC_MULT  = 1.85,
+
+    AUTO_RANK        = true,
+    RANK_QUEUE_DELAY = 2.5,
+    RANK_MODE_DELAY  = 1.2,
+    RANK_FIND_TIMEOUT = 10,
 }
 
-local CURRENT_SPEED_DELAY = 0.05
+local CURRENT_SPEED_DELAY = 0.20
 
 -- ════════════════════════════════════════════
 --  THAI DIACRITIC / TYPO TABLES
 -- ════════════════════════════════════════════
-
--- สระและวรรณยุกต์ที่อยู่บน/ล่างพยัญชนะ — ต้องเอื้อมกดแป้นไกลกว่า → delay × DIACRITIC_MULT
--- รวมถึง ์ (U+0E4C) ซึ่งคือ "การันต์" ที่ user พูดถึง
 local THAI_DIACRITICS = {}
 for _, cp in ipairs({
-    0x0E31, -- ั  sara a
-    0x0E34, -- ิ  sara i
-    0x0E35, -- ี  sara ii
-    0x0E36, -- ึ  sara ue
-    0x0E37, -- ื  sara uee
-    0x0E38, -- ุ  sara u
-    0x0E39, -- ู  sara uu
-    0x0E47, -- ็  mai taikhu
-    0x0E48, -- ่  mai ek
-    0x0E49, -- ้  mai tho
-    0x0E4A, -- ๊  mai tri
-    0x0E4B, -- ๋  mai chattawa
-    0x0E4C, -- ์  thanthakhat (การันต์)
-    0x0E4D, -- ํ  nikkhahit
-    0x0E4E, -- ๎  yamakkan
+    0x0E31, 0x0E34, 0x0E35, 0x0E36, 0x0E37,
+    0x0E38, 0x0E39, 0x0E47, 0x0E48, 0x0E49,
+    0x0E4A, 0x0E4B, 0x0E4C, 0x0E4D, 0x0E4E,
 }) do THAI_DIACRITICS[cp] = true end
 
--- พยัญชนะสำหรับแกล้งพิมพ์ผิด (เลือกตัวที่ไม่ใช่ตัวจริง)
 local TYPO_POOL = {
     "ก","ข","ค","ง","จ","ช","ด","ต","ท","น",
     "บ","ป","พ","ม","ย","ร","ล","ว","ส","ห","อ",
@@ -88,7 +78,6 @@ local CACHE_PATH      = "WordDB_ptnlp.txt"
 local FREQ_SOURCE_URL = "https://raw.githubusercontent.com/PyThaiNLP/pythainlp/dev/pythainlp/corpus/tnc_freq.txt"
 local FREQ_CACHE_PATH = "WordFreq_tnc.txt"
 
--- Colors available to both island config and expanded content controls
 local COLORS = {
     bg       = Color3.fromHex("0D0D0D"),
     border   = Color3.fromHex("2A2A2A"),
@@ -104,1301 +93,530 @@ local COLORS = {
     auto_txt = Color3.fromHex("44FF77"),
     auto_on  = Color3.fromHex("2E7D32"),
     ice      = Color3.fromHex("88CCFF"),
+    rank_on  = Color3.fromHex("7B2FBE"),
+    rank_txt = Color3.fromHex("D4AAFF"),
 }
 
 -- ════════════════════════════════════════════
 --  DYNAMIC ISLAND MODULE  (inlined IIFE)
---  Source: DynamicIsland.lua by user
 -- ════════════════════════════════════════════
 local DynamicIsland = (function()
---[[
-	DynamicIsland  (ModuleScript)
-	Apple-style "Dynamic Island" for Roblox UI. Pure Luau, TweenService only.
-
-	SETUP
-		* Put this ModuleScript in ReplicatedStorage (or next to your client code).
-		* Use a dedicated ScreenGui with ResetOnSpawn = false and
-		  ZIndexBehavior = Sibling (the default). Set IgnoreGuiInset = true if you
-		  want the island to sit at the very top of the screen.
-		* All sizes in the config are offset-based UDim2 values.
-
-	CONSTRUCTOR
-		DynamicIsland.new(screenGui, config?) -> island
-
-	STATES
-		island:SetState("Hidden" | "Compact" | "Minimal" | "Expanded")
-		island:GetState()
-		island:Show()      -- Compact
-		island:Hide()      -- Hidden
-		island:Expand()
-		island:Collapse()  -- Expanded -> Compact
-		island:Toggle()
-
-	COMPACT SLOTS
-		island:SetCompactContent({
-			LeftIcon, LeftIconColor, LeftText, LeftTextColor, LeftContent (Instance),
-			RightIcon, RightIconColor, RightText, RightTextColor, RightContent (Instance),
-		})
-		island:SetSlot("Left" | "Right", { Icon, IconColor, Text, TextColor, Content })
-		island:SetLeftIcon / SetLeftText / SetRightIcon / SetRightText(value, color?)
-		island:ClearCompactContent()
-
-	MINIMAL BADGE
-		island:SetMinimalContent({ Icon, IconColor, Text, TextColor })
-		(If you never call it, the Minimal badge mirrors LeftIcon.)
-
-	EXPANDED CONTENT
-		island:SetExpandedContent(GuiObject | function(container, island) -> cleanup?, size?)
-		island:SetExpandedSize(UDim2)
-		island:ClearExpandedContent()
-		island:SetDeliveryTracker(options) -> controller   (built-in preset, Live Activity style)
-		island:Notify(options)                             (built-in preset, auto-dismisses)
-
-	BUTTONS
-		island:CreateButton(props) -> TextButton with hover / press animation
-		DynamicIsland.AddHoverEffect(button, options?) -> cleanup function
-
-	EVENTS
-		island.StateChanged:Connect(function(newState, oldState) end)
-		island.Activated:Connect(function(stateWhenTapped) end)
-
-	CLEANUP
-		island:Destroy()
-]]
-
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
-
 local DynamicIsland = {}
 DynamicIsland.__index = DynamicIsland
-
-
 local STATES = { Hidden = true, Compact = true, Minimal = true, Expanded = true }
-
-----------------------------------------------------------------------
--- Defaults
-----------------------------------------------------------------------
-
 local DEFAULT_CONFIG = {
-	-- Geometry (offset-based UDim2)
-	CompactSize = UDim2.fromOffset(200, 38),
-	MinimalSize = UDim2.fromOffset(38, 38),
-	ExpandedSize = UDim2.fromOffset(340, 180),
-	ExpandedCornerRadius = 36,
-	ExpandedPadding = 18,
-	TopOffset = 12,
-	SlotPadding = 14,
-	MinimalSide = "Right", -- "Left" | "Right": which side of the compact pill the badge sits on
-	MinimalGap = 8,
-
-	-- Look
-	BackgroundColor = Color3.new(0, 0, 0),
-	TextColor = Color3.new(1, 1, 1),
-	AccentColor = Color3.fromRGB(10, 132, 255),
-	Font = Enum.Font.GothamMedium,
-	ZIndex = 100,
-
-	-- Behaviour
-	InitialState = "Compact",
-	ExpandOnClick = true,
-	CollapseOnOutsideClick = true,
-	PressEffect = true,
+    CompactSize = UDim2.fromOffset(200, 38),
+    MinimalSize = UDim2.fromOffset(38, 38),
+    ExpandedSize = UDim2.fromOffset(340, 180),
+    ExpandedCornerRadius = 36,
+    ExpandedPadding = 18,
+    TopOffset = 12,
+    SlotPadding = 14,
+    MinimalSide = "Right",
+    MinimalGap = 8,
+    BackgroundColor = Color3.new(0, 0, 0),
+    TextColor = Color3.new(1, 1, 1),
+    AccentColor = Color3.fromRGB(10, 132, 255),
+    Font = Enum.Font.GothamMedium,
+    ZIndex = 100,
+    InitialState = "Compact",
+    ExpandOnClick = true,
+    CollapseOnOutsideClick = true,
+    PressEffect = true,
 }
-
 local EASE = Enum.EasingStyle
 local OUT = Enum.EasingDirection.Out
-
--- Exposed as DynamicIsland.Tweens so you can tune the feel globally.
 local TWEENS = {
-	Grow = TweenInfo.new(0.55, EASE.Back, OUT), -- bouncy: island gets bigger
-	Shrink = TweenInfo.new(0.45, EASE.Quint, OUT), -- smooth: island gets smaller
-	Radius = TweenInfo.new(0.45, EASE.Quint, OUT),
-	Fade = TweenInfo.new(0.3, EASE.Quint, OUT),
-	LayerOut = TweenInfo.new(0.14, EASE.Quint, OUT),
-	LayerIn = TweenInfo.new(0.28, EASE.Quint, OUT, 0, false, 0.12),
-	Spring = TweenInfo.new(0.3, EASE.Back, OUT),
-	Hover = TweenInfo.new(0.18, EASE.Quint, OUT),
-	Progress = TweenInfo.new(0.6, EASE.Quint, OUT),
+    Grow = TweenInfo.new(0.55, EASE.Back, OUT),
+    Shrink = TweenInfo.new(0.45, EASE.Quint, OUT),
+    Radius = TweenInfo.new(0.45, EASE.Quint, OUT),
+    Fade = TweenInfo.new(0.3, EASE.Quint, OUT),
+    LayerOut = TweenInfo.new(0.14, EASE.Quint, OUT),
+    LayerIn = TweenInfo.new(0.28, EASE.Quint, OUT, 0, false, 0.12),
+    Spring = TweenInfo.new(0.3, EASE.Back, OUT),
+    Hover = TweenInfo.new(0.18, EASE.Quint, OUT),
+    Progress = TweenInfo.new(0.6, EASE.Quint, OUT),
 }
-
 DynamicIsland.Tweens = TWEENS
 DynamicIsland.DefaultConfig = DEFAULT_CONFIG
-
 local HOVER_SCALE = 1.05
 local PRESS_SCALE = 0.94
-
 local WHITE = Color3.new(1, 1, 1)
 local SECONDARY_TEXT = Color3.fromRGB(152, 152, 157)
 local SURFACE = Color3.fromRGB(44, 44, 46)
-
-----------------------------------------------------------------------
--- Helpers
-----------------------------------------------------------------------
-
 local function create(className, props, parent)
-	local instance = Instance.new(className)
-	for key, value in props do
-		instance[key] = value
-	end
-	if parent then
-		instance.Parent = parent
-	end
-	return instance
+    local instance = Instance.new(className)
+    for key, value in props do instance[key] = value end
+    if parent then instance.Parent = parent end
+    return instance
 end
-
-local function area(size)
-	return size.X.Offset * size.Y.Offset
-end
-
-local function radiusFor(size)
-	return math.min(size.X.Offset, size.Y.Offset) / 2
-end
-
+local function area(size) return size.X.Offset * size.Y.Offset end
+local function radiusFor(size) return math.min(size.X.Offset, size.Y.Offset) / 2 end
 local function mergeConfig(overrides)
-	local config = table.clone(DEFAULT_CONFIG)
-	if overrides then
-		for key, value in overrides do
-			config[key] = value
-		end
-	end
-	return config
+    local config = table.clone(DEFAULT_CONFIG)
+    if overrides then for key, value in overrides do config[key] = value end end
+    return config
 end
-
 local function clearHolder(holder)
-	for _, child in holder:GetChildren() do
-		if not child:IsA("UIPadding") then
-			child:Destroy()
-		end
-	end
+    for _, child in holder:GetChildren() do
+        if not child:IsA("UIPadding") then child:Destroy() end
+    end
 end
-
 local function newLayer(name, parent, size)
-	return create("CanvasGroup", {
-		Name = name,
-		AnchorPoint = Vector2.new(0.5, 0),
-		Position = UDim2.fromScale(0.5, 0),
-		Size = size,
-		BackgroundTransparency = 1,
-		BorderSizePixel = 0,
-		GroupTransparency = 1,
-		Visible = false,
-		ZIndex = 2,
-	}, parent)
+    return create("CanvasGroup", {
+        Name = name, AnchorPoint = Vector2.new(0.5, 0),
+        Position = UDim2.fromScale(0.5, 0), Size = size,
+        BackgroundTransparency = 1, BorderSizePixel = 0,
+        GroupTransparency = 1, Visible = false, ZIndex = 2,
+    }, parent)
 end
-
 local function newSlot(parent, side, config)
-	local isLeft = side == "Left"
-	local slot = create("Frame", {
-		Name = side .. "Slot",
-		BackgroundTransparency = 1,
-		BorderSizePixel = 0,
-		AnchorPoint = Vector2.new(isLeft and 0 or 1, 0.5),
-		Position = UDim2.new(isLeft and 0 or 1, isLeft and config.SlotPadding or -config.SlotPadding, 0.5, 0),
-		Size = UDim2.new(0, 0, 1, -12),
-		AutomaticSize = Enum.AutomaticSize.X,
-	}, parent)
-	create("UIListLayout", {
-		FillDirection = Enum.FillDirection.Horizontal,
-		HorizontalAlignment = if isLeft then Enum.HorizontalAlignment.Left else Enum.HorizontalAlignment.Right,
-		VerticalAlignment = Enum.VerticalAlignment.Center,
-		SortOrder = Enum.SortOrder.LayoutOrder,
-		Padding = UDim.new(0, 6),
-	}, slot)
-	return slot
+    local isLeft = side == "Left"
+    local slot = create("Frame", {
+        Name = side .. "Slot", BackgroundTransparency = 1, BorderSizePixel = 0,
+        AnchorPoint = Vector2.new(isLeft and 0 or 1, 0.5),
+        Position = UDim2.new(isLeft and 0 or 1, isLeft and config.SlotPadding or -config.SlotPadding, 0.5, 0),
+        Size = UDim2.new(0, 0, 1, -12), AutomaticSize = Enum.AutomaticSize.X,
+    }, parent)
+    create("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        HorizontalAlignment = if isLeft then Enum.HorizontalAlignment.Left else Enum.HorizontalAlignment.Right,
+        VerticalAlignment = Enum.VerticalAlignment.Center,
+        SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6),
+    }, slot)
+    return slot
 end
-
 local function ensureIcon(island, side)
-	local slot = island._slots[side]
-	if not slot.Icon then
-		local size = math.max(12, island._config.CompactSize.Y.Offset - 16)
-		slot.Icon = create("ImageLabel", {
-			Name = "Icon",
-			BackgroundTransparency = 1,
-			LayoutOrder = 1,
-			ScaleType = Enum.ScaleType.Fit,
-			Size = UDim2.fromOffset(size, size),
-			ImageColor3 = WHITE,
-		}, slot.Frame)
-	end
-	return slot.Icon
+    local slot = island._slots[side]
+    if not slot.Icon then
+        local size = math.max(12, island._config.CompactSize.Y.Offset - 16)
+        slot.Icon = create("ImageLabel", {
+            Name = "Icon", BackgroundTransparency = 1, LayoutOrder = 1,
+            ScaleType = Enum.ScaleType.Fit, Size = UDim2.fromOffset(size, size), ImageColor3 = WHITE,
+        }, slot.Frame)
+    end
+    return slot.Icon
 end
-
 local function ensureText(island, side)
-	local slot = island._slots[side]
-	if not slot.Text then
-		slot.Text = create("TextLabel", {
-			Name = "Text",
-			BackgroundTransparency = 1,
-			LayoutOrder = 2,
-			Size = UDim2.new(0, 0, 1, 0),
-			AutomaticSize = Enum.AutomaticSize.X,
-			Font = island._config.Font,
-			TextSize = 14,
-			TextColor3 = island._config.TextColor,
-			TextXAlignment = if side == "Left" then Enum.TextXAlignment.Left else Enum.TextXAlignment.Right,
-			Text = "",
-		}, slot.Frame)
-	end
-	return slot.Text
+    local slot = island._slots[side]
+    if not slot.Text then
+        slot.Text = create("TextLabel", {
+            Name = "Text", BackgroundTransparency = 1, LayoutOrder = 2,
+            Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X,
+            Font = island._config.Font, TextSize = 14, TextColor3 = island._config.TextColor,
+            TextXAlignment = if side == "Left" then Enum.TextXAlignment.Left else Enum.TextXAlignment.Right,
+            Text = "",
+        }, slot.Frame)
+    end
+    return slot.Text
 end
-
 local function patchIcon(island, side, image, color)
-	local icon = ensureIcon(island, side)
-	icon.Image = image or ""
-	icon.Visible = image ~= nil
-	if color then
-		icon.ImageColor3 = color
-	end
+    local icon = ensureIcon(island, side)
+    icon.Image = image or ""; icon.Visible = image ~= nil
+    if color then icon.ImageColor3 = color end
 end
-
 local function patchText(island, side, text, color)
-	local label = ensureText(island, side)
-	label.Text = text or ""
-	label.Visible = text ~= nil
-	if color then
-		label.TextColor3 = color
-	end
+    local label = ensureText(island, side)
+    label.Text = text or ""; label.Visible = text ~= nil
+    if color then label.TextColor3 = color end
 end
-
-----------------------------------------------------------------------
--- Button hover / press effect (works on any TextButton / ImageButton)
-----------------------------------------------------------------------
-
 function DynamicIsland.AddHoverEffect(button, options)
-	options = options or {}
-	local baseColor = button.BackgroundColor3
-	local hoverColor = options.HoverColor or baseColor:Lerp(WHITE, 0.16)
-	local hoverScale = options.HoverScale or 1.06
-	local pressScale = options.PressScale or 0.92
-
-	local uiScale = button:FindFirstChildOfClass("UIScale")
-	if not uiScale then
-		uiScale = Instance.new("UIScale")
-		uiScale.Parent = button
-	end
-
-	local hovering = false
-	local function apply(scale, color)
-		TweenService:Create(uiScale, TWEENS.Spring, { Scale = scale }):Play()
-		TweenService:Create(button, TWEENS.Hover, { BackgroundColor3 = color }):Play()
-	end
-
-	local connections = {
-		button.MouseEnter:Connect(function()
-			hovering = true
-			apply(hoverScale, hoverColor)
-		end),
-		button.MouseLeave:Connect(function()
-			hovering = false
-			apply(1, baseColor)
-		end),
-		button.MouseButton1Down:Connect(function()
-			apply(pressScale, baseColor)
-		end),
-		button.MouseButton1Up:Connect(function()
-			if hovering then
-				apply(hoverScale, hoverColor)
-			else
-				apply(1, baseColor)
-			end
-		end),
-	}
-
-	return function()
-		for _, connection in connections do
-			connection:Disconnect()
-		end
-		uiScale.Scale = 1
-	end
+    options = options or {}
+    local baseColor = button.BackgroundColor3
+    local hoverColor = options.HoverColor or baseColor:Lerp(WHITE, 0.16)
+    local hoverScale = options.HoverScale or 1.06
+    local pressScale = options.PressScale or 0.92
+    local uiScale = button:FindFirstChildOfClass("UIScale")
+    if not uiScale then uiScale = Instance.new("UIScale"); uiScale.Parent = button end
+    local hovering = false
+    local function apply(scale, color)
+        TweenService:Create(uiScale, TWEENS.Spring, { Scale = scale }):Play()
+        TweenService:Create(button, TWEENS.Hover, { BackgroundColor3 = color }):Play()
+    end
+    local connections = {
+        button.MouseEnter:Connect(function() hovering = true; apply(hoverScale, hoverColor) end),
+        button.MouseLeave:Connect(function() hovering = false; apply(1, baseColor) end),
+        button.MouseButton1Down:Connect(function() apply(pressScale, baseColor) end),
+        button.MouseButton1Up:Connect(function()
+            if hovering then apply(hoverScale, hoverColor) else apply(1, baseColor) end
+        end),
+    }
+    return function()
+        for _, connection in connections do connection:Disconnect() end
+        uiScale.Scale = 1
+    end
 end
-
-----------------------------------------------------------------------
--- Constructor
-----------------------------------------------------------------------
-
 function DynamicIsland.new(screenGui, config)
-	assert(
-		typeof(screenGui) == "Instance" and screenGui:IsA("LayerCollector"),
-		"DynamicIsland.new expects a ScreenGui"
-	)
-
-	local self = setmetatable({}, DynamicIsland)
-	local c = mergeConfig(config)
-
-	self._config = c
-	self._screenGui = screenGui
-	self._connections = {}
-	self._tweens = {}
-	self._transitionId = 0
-	self._destroyed = false
-	self._state = "Hidden"
-	self._targetSize = UDim2.fromOffset(0, 0)
-	self._primarySize = c.ExpandedSize
-	self._expandedSize = c.ExpandedSize
-	self._hovering = false
-	self._minimalExplicit = false
-	self._notifActive = false
-	self._notifToken = 0
-	self._returnState = nil
-
-	-- Events
-	local stateChanged = Instance.new("BindableEvent")
-	local activated = Instance.new("BindableEvent")
-	self._stateChangedEvent = stateChanged
-	self._activatedEvent = activated
-	self.StateChanged = stateChanged.Event
-	self.Activated = activated.Event
-
-	-- Root: full-screen, transparent, never sinks input by itself
-	local holder = create("Frame", {
-		Name = "DynamicIsland",
-		BackgroundTransparency = 1,
-		BorderSizePixel = 0,
-		Size = UDim2.fromScale(1, 1),
-		ZIndex = c.ZIndex,
-	}, screenGui)
-	self._holder = holder
-
-	-- Click-outside catcher (only visible while Expanded)
-	self._backdrop = create("TextButton", {
-		Name = "Backdrop",
-		Text = "",
-		AutoButtonColor = false,
-		BackgroundTransparency = 1,
-		BorderSizePixel = 0,
-		Size = UDim2.fromScale(1, 1),
-		Visible = false,
-		ZIndex = 1,
-	}, holder)
-
-	-- The island itself
-	local body = create("CanvasGroup", {
-		Name = "Body",
-		AnchorPoint = Vector2.new(0.5, 0),
-		Position = UDim2.new(0.5, 0, 0, c.TopOffset),
-		Size = UDim2.fromOffset(0, 0),
-		BackgroundColor3 = c.BackgroundColor,
-		BorderSizePixel = 0,
-		GroupTransparency = 1,
-		Visible = false,
-		ZIndex = 2,
-	}, holder)
-	self._body = body
-	self._corner = create("UICorner", { CornerRadius = UDim.new(0, radiusFor(c.CompactSize)) }, body)
-	self._uiScale = create("UIScale", { Scale = 1 }, body)
-
-	-- Tap surface for Compact / Minimal (sits below the layers so slot buttons still win)
-	self._hitbox = create("TextButton", {
-		Name = "Hitbox",
-		Text = "",
-		AutoButtonColor = false,
-		BackgroundTransparency = 1,
-		BorderSizePixel = 0,
-		Size = UDim2.fromScale(1, 1),
-		ZIndex = 1,
-	}, body)
-
-	-- Layers (cross-faded between states). Each has a fixed size so content
-	-- never reflows while the body is growing or shrinking around it.
-	local compact = newLayer("Compact", body, c.CompactSize)
-	local minimal = newLayer("Minimal", body, c.MinimalSize)
-	local expanded = newLayer("Expanded", body, c.ExpandedSize)
-	self._layers = { Compact = compact, Minimal = minimal, Expanded = expanded }
-	self._expandedLayer = expanded
-
-	-- Compact slots
-	self._slots = {
-		Left = { Frame = newSlot(compact, "Left", c) },
-		Right = { Frame = newSlot(compact, "Right", c) },
-	}
-
-	-- Minimal badge
-	self._minimalIcon = create("ImageLabel", {
-		Name = "Icon",
-		AnchorPoint = Vector2.new(0.5, 0.5),
-		Position = UDim2.fromScale(0.5, 0.5),
-		Size = UDim2.fromOffset(math.max(12, c.MinimalSize.Y.Offset - 18), math.max(12, c.MinimalSize.Y.Offset - 18)),
-		BackgroundTransparency = 1,
-		ScaleType = Enum.ScaleType.Fit,
-		Visible = false,
-	}, minimal)
-	self._minimalLabel = create("TextLabel", {
-		Name = "Label",
-		AnchorPoint = Vector2.new(0.5, 0.5),
-		Position = UDim2.fromScale(0.5, 0.5),
-		Size = UDim2.fromScale(1, 1),
-		BackgroundTransparency = 1,
-		Font = Enum.Font.GothamBold,
-		TextSize = 13,
-		TextColor3 = c.TextColor,
-		Text = "",
-		Visible = false,
-	}, minimal)
-
-	-- Expanded content holders (primary content + temporary notification)
-	local function newHolder(name, visible)
-		local frame = create("Frame", {
-			Name = name,
-			BackgroundTransparency = 1,
-			BorderSizePixel = 0,
-			Size = UDim2.fromScale(1, 1),
-			Visible = visible,
-		}, expanded)
-		create("UIPadding", {
-			PaddingTop = UDim.new(0, c.ExpandedPadding),
-			PaddingBottom = UDim.new(0, c.ExpandedPadding),
-			PaddingLeft = UDim.new(0, c.ExpandedPadding),
-			PaddingRight = UDim.new(0, c.ExpandedPadding),
-		}, frame)
-		return frame
-	end
-	self._contentHolder = newHolder("Content", true)
-	self._notifHolder = newHolder("Notification", false)
-
-	-- Input
-	local function connect(signal, callback)
-		table.insert(self._connections, signal:Connect(callback))
-	end
-
-	local hitbox = self._hitbox
-	local function canHover()
-		return c.PressEffect and UserInputService.MouseEnabled
-	end
-
-	connect(hitbox.MouseEnter, function()
-		self._hovering = true
-		if canHover() then
-			self:_setPressScale(HOVER_SCALE)
-		end
-	end)
-	connect(hitbox.MouseLeave, function()
-		self._hovering = false
-		self:_setPressScale(1)
-	end)
-	connect(hitbox.MouseButton1Down, function()
-		if c.PressEffect then
-			self:_setPressScale(PRESS_SCALE)
-		end
-	end)
-	connect(hitbox.MouseButton1Up, function()
-		self:_setPressScale((self._hovering and canHover()) and HOVER_SCALE or 1)
-	end)
-	connect(hitbox.Activated, function()
-		activated:Fire(self._state)
-		if c.ExpandOnClick then
-			self:Expand()
-		end
-	end)
-	connect(self._backdrop.Activated, function()
-		self:Collapse()
-	end)
-
-	assert(STATES[c.InitialState], "DynamicIsland: invalid InitialState")
-	self:_goto(c.InitialState, false)
-
-	return self
+    assert(typeof(screenGui) == "Instance" and screenGui:IsA("LayerCollector"), "DynamicIsland.new expects a ScreenGui")
+    local self = setmetatable({}, DynamicIsland)
+    local c = mergeConfig(config)
+    self._config = c; self._screenGui = screenGui; self._connections = {}; self._tweens = {}
+    self._transitionId = 0; self._destroyed = false; self._state = "Hidden"
+    self._targetSize = UDim2.fromOffset(0, 0); self._primarySize = c.ExpandedSize
+    self._expandedSize = c.ExpandedSize; self._hovering = false; self._minimalExplicit = false
+    self._notifActive = false; self._notifToken = 0; self._returnState = nil
+    local stateChanged = Instance.new("BindableEvent")
+    local activated = Instance.new("BindableEvent")
+    self._stateChangedEvent = stateChanged; self._activatedEvent = activated
+    self.StateChanged = stateChanged.Event; self.Activated = activated.Event
+    local holder = create("Frame", {
+        Name = "DynamicIsland", BackgroundTransparency = 1, BorderSizePixel = 0,
+        Size = UDim2.fromScale(1, 1), ZIndex = c.ZIndex,
+    }, screenGui)
+    self._holder = holder
+    self._backdrop = create("TextButton", {
+        Name = "Backdrop", Text = "", AutoButtonColor = false, BackgroundTransparency = 1,
+        BorderSizePixel = 0, Size = UDim2.fromScale(1, 1), Visible = false, ZIndex = 1,
+    }, holder)
+    local body = create("CanvasGroup", {
+        Name = "Body", AnchorPoint = Vector2.new(0.5, 0),
+        Position = UDim2.new(0.5, 0, 0, c.TopOffset), Size = UDim2.fromOffset(0, 0),
+        BackgroundColor3 = c.BackgroundColor, BorderSizePixel = 0,
+        GroupTransparency = 1, Visible = false, ZIndex = 2,
+    }, holder)
+    self._body = body
+    self._corner = create("UICorner", { CornerRadius = UDim.new(0, radiusFor(c.CompactSize)) }, body)
+    self._uiScale = create("UIScale", { Scale = 1 }, body)
+    self._hitbox = create("TextButton", {
+        Name = "Hitbox", Text = "", AutoButtonColor = false, BackgroundTransparency = 1,
+        BorderSizePixel = 0, Size = UDim2.fromScale(1, 1), ZIndex = 1,
+    }, body)
+    local compact = newLayer("Compact", body, c.CompactSize)
+    local minimal = newLayer("Minimal", body, c.MinimalSize)
+    local expanded = newLayer("Expanded", body, c.ExpandedSize)
+    self._layers = { Compact = compact, Minimal = minimal, Expanded = expanded }
+    self._expandedLayer = expanded
+    self._slots = {
+        Left  = { Frame = newSlot(compact, "Left",  c) },
+        Right = { Frame = newSlot(compact, "Right", c) },
+    }
+    self._minimalIcon = create("ImageLabel", {
+        Name = "Icon", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromOffset(math.max(12, c.MinimalSize.Y.Offset - 18), math.max(12, c.MinimalSize.Y.Offset - 18)),
+        BackgroundTransparency = 1, ScaleType = Enum.ScaleType.Fit, Visible = false,
+    }, minimal)
+    self._minimalLabel = create("TextLabel", {
+        Name = "Label", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = c.TextColor, Text = "", Visible = false,
+    }, minimal)
+    local function newHolder(name, visible)
+        local frame = create("Frame", {
+            Name = name, BackgroundTransparency = 1, BorderSizePixel = 0,
+            Size = UDim2.fromScale(1, 1), Visible = visible,
+        }, expanded)
+        create("UIPadding", {
+            PaddingTop = UDim.new(0, c.ExpandedPadding), PaddingBottom = UDim.new(0, c.ExpandedPadding),
+            PaddingLeft = UDim.new(0, c.ExpandedPadding), PaddingRight = UDim.new(0, c.ExpandedPadding),
+        }, frame)
+        return frame
+    end
+    self._contentHolder = newHolder("Content", true)
+    self._notifHolder   = newHolder("Notification", false)
+    local function connect(signal, callback)
+        table.insert(self._connections, signal:Connect(callback))
+    end
+    local hitbox = self._hitbox
+    local function canHover() return c.PressEffect and UserInputService.MouseEnabled end
+    connect(hitbox.MouseEnter,       function() self._hovering = true;  if canHover() then self:_setPressScale(HOVER_SCALE) end end)
+    connect(hitbox.MouseLeave,       function() self._hovering = false; self:_setPressScale(1) end)
+    connect(hitbox.MouseButton1Down, function() if c.PressEffect then self:_setPressScale(PRESS_SCALE) end end)
+    connect(hitbox.MouseButton1Up,   function() self:_setPressScale((self._hovering and canHover()) and HOVER_SCALE or 1) end)
+    connect(hitbox.Activated,        function() activated:Fire(self._state); if c.ExpandOnClick then self:Expand() end end)
+    connect(self._backdrop.Activated, function() self:Collapse() end)
+    assert(STATES[c.InitialState], "DynamicIsland: invalid InitialState")
+    self:_goto(c.InitialState, false)
+    return self
 end
-
-----------------------------------------------------------------------
--- Internal: transitions
-----------------------------------------------------------------------
-
 function DynamicIsland:_getTarget(state)
-	local c = self._config
-	local top = c.TopOffset
-
-	if state == "Compact" then
-		return {
-			Size = c.CompactSize,
-			Position = UDim2.new(0.5, 0, 0, top),
-			Radius = radiusFor(c.CompactSize),
-		}
-	elseif state == "Minimal" then
-		local direction = if c.MinimalSide == "Left" then -1 else 1
-		local x = direction * (c.CompactSize.X.Offset / 2 + c.MinimalGap + c.MinimalSize.X.Offset / 2)
-		return {
-			Size = c.MinimalSize,
-			Position = UDim2.new(0.5, x, 0, top),
-			Radius = radiusFor(c.MinimalSize),
-		}
-	elseif state == "Expanded" then
-		return {
-			Size = self._expandedSize,
-			Position = UDim2.new(0.5, 0, 0, top),
-			Radius = c.ExpandedCornerRadius,
-		}
-	end
-
-	-- Hidden: collapse into the middle of where the pill sits
-	return {
-		Size = UDim2.fromOffset(0, 0),
-		Position = UDim2.new(0.5, 0, 0, top + c.CompactSize.Y.Offset / 2),
-		Radius = radiusFor(c.CompactSize),
-	}
+    local c = self._config; local top = c.TopOffset
+    if state == "Compact" then
+        return { Size = c.CompactSize, Position = UDim2.new(0.5,0,0,top), Radius = radiusFor(c.CompactSize) }
+    elseif state == "Minimal" then
+        local direction = if c.MinimalSide == "Left" then -1 else 1
+        local x = direction * (c.CompactSize.X.Offset/2 + c.MinimalGap + c.MinimalSize.X.Offset/2)
+        return { Size = c.MinimalSize, Position = UDim2.new(0.5,x,0,top), Radius = radiusFor(c.MinimalSize) }
+    elseif state == "Expanded" then
+        return { Size = self._expandedSize, Position = UDim2.new(0.5,0,0,top), Radius = c.ExpandedCornerRadius }
+    end
+    return { Size = UDim2.fromOffset(0,0), Position = UDim2.new(0.5,0,0,top + c.CompactSize.Y.Offset/2), Radius = radiusFor(c.CompactSize) }
 end
-
 function DynamicIsland:_animate(instance, info, props, animated)
-	if not animated then
-		for key, value in props do
-			instance[key] = value
-		end
-		return nil
-	end
-	local tween = TweenService:Create(instance, info, props)
-	table.insert(self._tweens, tween)
-	tween:Play()
-	return tween
+    if not animated then for key, value in props do instance[key] = value end; return nil end
+    local tween = TweenService:Create(instance, info, props)
+    table.insert(self._tweens, tween); tween:Play(); return tween
 end
-
 function DynamicIsland:_cancelTweens()
-	for _, tween in self._tweens do
-		tween:Cancel()
-	end
-	table.clear(self._tweens)
+    for _, tween in self._tweens do tween:Cancel() end; table.clear(self._tweens)
 end
-
 function DynamicIsland:_setPressScale(scale)
-	TweenService:Create(self._uiScale, TWEENS.Spring, { Scale = scale }):Play()
+    TweenService:Create(self._uiScale, TWEENS.Spring, { Scale = scale }):Play()
 end
-
 function DynamicIsland:_goto(state, animated)
-	self._transitionId += 1
-	local id = self._transitionId
-	self:_cancelTweens()
-
-	local target = self:_getTarget(state)
-	local growing = area(target.Size) > area(self._targetSize)
-	self._targetSize = target.Size
-	self._state = state
-
-	local body = self._body
-	if state ~= "Hidden" then
-		body.Visible = true
-	end
-
-	-- Body: size + position (bouncy when growing, smooth when shrinking), radius, fade
-	self:_animate(
-		body,
-		growing and TWEENS.Grow or TWEENS.Shrink,
-		{ Size = target.Size, Position = target.Position },
-		animated
-	)
-	self:_animate(self._corner, TWEENS.Radius, { CornerRadius = UDim.new(0, target.Radius) }, animated)
-	local fade = self:_animate(
-		body,
-		TWEENS.Fade,
-		{ GroupTransparency = if state == "Hidden" then 1 else 0 },
-		animated
-	)
-
-	if state == "Hidden" then
-		if fade then
-			fade.Completed:Connect(function(playbackState)
-				if id == self._transitionId and playbackState == Enum.PlaybackState.Completed then
-					body.Visible = false
-				end
-			end)
-		else
-			body.Visible = false
-		end
-	end
-
-	-- Input surfaces
-	local interactive = state == "Compact" or state == "Minimal"
-	self._hitbox.Visible = interactive
-	self._backdrop.Visible = state == "Expanded" and self._config.CollapseOnOutsideClick
-	if not interactive then
-		self._hovering = false
-		self:_setPressScale(1)
-	end
-
-	-- Layers: fade the old one out quickly, fade the new one in with a short delay
-	for name, layer in self._layers do
-		if name == state then
-			layer.Visible = true
-			self:_animate(layer, TWEENS.LayerIn, { GroupTransparency = 0 }, animated)
-		elseif layer.Visible then
-			local function retire()
-				layer.Visible = false
-				if name == "Expanded" and self._notifActive then
-					self:_endNotification()
-				end
-			end
-			local tween = self:_animate(layer, TWEENS.LayerOut, { GroupTransparency = 1 }, animated)
-			if tween then
-				tween.Completed:Connect(function(playbackState)
-					if id == self._transitionId and playbackState == Enum.PlaybackState.Completed then
-						retire()
-					end
-				end)
-			else
-				retire()
-			end
-		end
-	end
+    self._transitionId += 1; local id = self._transitionId
+    self:_cancelTweens()
+    local target = self:_getTarget(state)
+    local growing = area(target.Size) > area(self._targetSize)
+    self._targetSize = target.Size; self._state = state
+    local body = self._body
+    if state ~= "Hidden" then body.Visible = true end
+    self:_animate(body, growing and TWEENS.Grow or TWEENS.Shrink, { Size = target.Size, Position = target.Position }, animated)
+    self:_animate(self._corner, TWEENS.Radius, { CornerRadius = UDim.new(0, target.Radius) }, animated)
+    local fade = self:_animate(body, TWEENS.Fade, { GroupTransparency = if state == "Hidden" then 1 else 0 }, animated)
+    if state == "Hidden" then
+        if fade then
+            fade.Completed:Connect(function(ps)
+                if id == self._transitionId and ps == Enum.PlaybackState.Completed then body.Visible = false end
+            end)
+        else body.Visible = false end
+    end
+    local interactive = state == "Compact" or state == "Minimal"
+    self._hitbox.Visible   = interactive
+    self._backdrop.Visible = state == "Expanded" and self._config.CollapseOnOutsideClick
+    if not interactive then self._hovering = false; self:_setPressScale(1) end
+    for name, layer in self._layers do
+        if name == state then
+            layer.Visible = true
+            self:_animate(layer, TWEENS.LayerIn, { GroupTransparency = 0 }, animated)
+        elseif layer.Visible then
+            local function retire()
+                layer.Visible = false
+                if name == "Expanded" and self._notifActive then self:_endNotification() end
+            end
+            local tween = self:_animate(layer, TWEENS.LayerOut, { GroupTransparency = 1 }, animated)
+            if tween then
+                tween.Completed:Connect(function(ps)
+                    if id == self._transitionId and ps == Enum.PlaybackState.Completed then retire() end
+                end)
+            else retire() end
+        end
+    end
 end
-
 function DynamicIsland:_endNotification()
-	if not self._notifActive then
-		return
-	end
-	self._notifActive = false
-	self._returnState = nil
-	clearHolder(self._notifHolder)
-	self._notifHolder.Visible = false
-	self._contentHolder.Visible = true
-	self._expandedSize = self._primarySize
-	self._expandedLayer.Size = self._primarySize
+    if not self._notifActive then return end
+    self._notifActive = false; self._returnState = nil
+    clearHolder(self._notifHolder); self._notifHolder.Visible = false
+    self._contentHolder.Visible = true
+    self._expandedSize = self._primarySize; self._expandedLayer.Size = self._primarySize
 end
-
-----------------------------------------------------------------------
--- Public: states
-----------------------------------------------------------------------
-
-function DynamicIsland:SetState(state: StateName)
-	if not STATES[state] then
-		error(("DynamicIsland: invalid state '%s'"):format(tostring(state)), 2)
-	end
-	if self._destroyed or state == self._state then
-		return
-	end
-	if state == "Expanded" and self._notifActive and self._state ~= "Expanded" then
-		self:_endNotification()
-	end
-	local previous = self._state
-	self:_goto(state, true)
-	self._stateChangedEvent:Fire(state, previous)
+function DynamicIsland:SetState(state)
+    if not STATES[state] then error(("DynamicIsland: invalid state '%s'"):format(tostring(state)), 2) end
+    if self._destroyed or state == self._state then return end
+    if state == "Expanded" and self._notifActive and self._state ~= "Expanded" then self:_endNotification() end
+    local previous = self._state; self:_goto(state, true); self._stateChangedEvent:Fire(state, previous)
 end
-
-function DynamicIsland:GetState(): StateName
-	return self._state
-end
-
-function DynamicIsland:Show()
-	self:SetState("Compact")
-end
-
-function DynamicIsland:Hide()
-	self:SetState("Hidden")
-end
-
-function DynamicIsland:Expand()
-	self:SetState("Expanded")
-end
-
+function DynamicIsland:GetState() return self._state end
+function DynamicIsland:Show()    self:SetState("Compact")  end
+function DynamicIsland:Hide()    self:SetState("Hidden")   end
+function DynamicIsland:Expand()  self:SetState("Expanded") end
 function DynamicIsland:Collapse()
-	if self._state ~= "Expanded" then
-		return
-	end
-	local target = "Compact"
-	if self._notifActive and self._returnState and self._returnState ~= "Expanded" then
-		target = self._returnState
-	end
-	self:SetState(target)
+    if self._state ~= "Expanded" then return end
+    local target = "Compact"
+    if self._notifActive and self._returnState and self._returnState ~= "Expanded" then target = self._returnState end
+    self:SetState(target)
 end
-
 function DynamicIsland:Toggle()
-	if self._state == "Expanded" then
-		self:Collapse()
-	else
-		self:Expand()
-	end
+    if self._state == "Expanded" then self:Collapse() else self:Expand() end
 end
-
-----------------------------------------------------------------------
--- Public: compact slots
-----------------------------------------------------------------------
-
--- Replaces everything in one slot. Pass nil to clear it.
 function DynamicIsland:SetSlot(side, spec)
-	local slot = self._slots[side]
-	assert(slot, "DynamicIsland:SetSlot side must be 'Left' or 'Right'")
-	spec = spec or {}
-
-	if spec.Icon ~= nil then
-		patchIcon(self, side, spec.Icon, spec.IconColor or WHITE)
-	elseif slot.Icon then
-		slot.Icon.Visible = false
-	end
-
-	if spec.Text ~= nil then
-		patchText(self, side, spec.Text, spec.TextColor or self._config.TextColor)
-	elseif slot.Text then
-		slot.Text.Visible = false
-	end
-
-	if slot.Custom and slot.Custom ~= spec.Content then
-		slot.Custom.Parent = nil
-		slot.Custom = nil
-	end
-	if spec.Content then
-		slot.Custom = spec.Content
-		spec.Content.LayoutOrder = 3
-		spec.Content.Parent = slot.Frame
-	end
+    local slot = self._slots[side]; assert(slot, "side must be 'Left' or 'Right'"); spec = spec or {}
+    if spec.Icon ~= nil then patchIcon(self, side, spec.Icon, spec.IconColor or WHITE)
+    elseif slot.Icon then slot.Icon.Visible = false end
+    if spec.Text ~= nil then patchText(self, side, spec.Text, spec.TextColor or self._config.TextColor)
+    elseif slot.Text then slot.Text.Visible = false end
+    if slot.Custom and slot.Custom ~= spec.Content then slot.Custom.Parent = nil; slot.Custom = nil end
+    if spec.Content then slot.Custom = spec.Content; spec.Content.LayoutOrder = 3; spec.Content.Parent = slot.Frame end
 end
-
 function DynamicIsland:SetCompactContent(content)
-	content = content or {}
-	for _, side in { "Left", "Right" } do
-		local spec = {
-			Icon = content[side .. "Icon"],
-			IconColor = content[side .. "IconColor"],
-			Text = content[side .. "Text"],
-			TextColor = content[side .. "TextColor"],
-			Content = content[side .. "Content"],
-		}
-		if next(spec) ~= nil then
-			self:SetSlot(side, spec)
-		end
-	end
-	if content.LeftIcon and not self._minimalExplicit then
-		self:_applyMinimal({ Icon = content.LeftIcon, IconColor = content.LeftIconColor })
-	end
+    content = content or {}
+    for _, side in { "Left", "Right" } do
+        local spec = {
+            Icon      = content[side.."Icon"],     IconColor = content[side.."IconColor"],
+            Text      = content[side.."Text"],     TextColor = content[side.."TextColor"],
+            Content   = content[side.."Content"],
+        }
+        if next(spec) ~= nil then self:SetSlot(side, spec) end
+    end
+    if content.LeftIcon and not self._minimalExplicit then
+        self:_applyMinimal({ Icon = content.LeftIcon, IconColor = content.LeftIconColor })
+    end
 end
-
-function DynamicIsland:ClearCompactContent()
-	self:SetSlot("Left", nil)
-	self:SetSlot("Right", nil)
-end
-
--- Single-property updaters (cheap enough to call every second for timers)
-function DynamicIsland:SetLeftIcon(image, color)
-	patchIcon(self, "Left", image, color)
-	if not self._minimalExplicit then
-		self:_applyMinimal({ Icon = image, IconColor = color })
-	end
-end
-
-function DynamicIsland:SetLeftText(text, color)
-	patchText(self, "Left", text, color)
-end
-
-function DynamicIsland:SetRightIcon(image, color)
-	patchIcon(self, "Right", image, color)
-end
-
-function DynamicIsland:SetRightText(text, color)
-	patchText(self, "Right", text, color)
-end
-
-function DynamicIsland:SetLeftContent(instance)
-	self:SetSlot("Left", { Content = instance })
-end
-
-function DynamicIsland:SetRightContent(instance)
-	self:SetSlot("Right", { Content = instance })
-end
-
-----------------------------------------------------------------------
--- Public: minimal badge
-----------------------------------------------------------------------
-
+function DynamicIsland:ClearCompactContent() self:SetSlot("Left",nil); self:SetSlot("Right",nil) end
+function DynamicIsland:SetLeftIcon(image,color)  patchIcon(self,"Left",image,color); if not self._minimalExplicit then self:_applyMinimal({Icon=image,IconColor=color}) end end
+function DynamicIsland:SetLeftText(text,color)   patchText(self,"Left",text,color) end
+function DynamicIsland:SetRightIcon(image,color) patchIcon(self,"Right",image,color) end
+function DynamicIsland:SetRightText(text,color)  patchText(self,"Right",text,color) end
+function DynamicIsland:SetLeftContent(instance)  self:SetSlot("Left",{Content=instance}) end
+function DynamicIsland:SetRightContent(instance) self:SetSlot("Right",{Content=instance}) end
 function DynamicIsland:_applyMinimal(spec)
-	local icon, label = self._minimalIcon, self._minimalLabel
-	icon.Visible = spec.Icon ~= nil
-	if spec.Icon ~= nil then
-		icon.Image = spec.Icon
-		icon.ImageColor3 = spec.IconColor or WHITE
-	end
-	label.Visible = spec.Text ~= nil
-	if spec.Text ~= nil then
-		label.Text = spec.Text
-		label.TextColor3 = spec.TextColor or self._config.TextColor
-	end
+    local icon,label = self._minimalIcon, self._minimalLabel
+    icon.Visible = spec.Icon ~= nil
+    if spec.Icon ~= nil then icon.Image = spec.Icon; icon.ImageColor3 = spec.IconColor or WHITE end
+    label.Visible = spec.Text ~= nil
+    if spec.Text ~= nil then label.Text = spec.Text; label.TextColor3 = spec.TextColor or self._config.TextColor end
 end
-
-function DynamicIsland:SetMinimalContent(spec)
-	self._minimalExplicit = true
-	self:_applyMinimal(spec or {})
-end
-
-----------------------------------------------------------------------
--- Public: expanded content
-----------------------------------------------------------------------
-
+function DynamicIsland:SetMinimalContent(spec) self._minimalExplicit = true; self:_applyMinimal(spec or {}) end
 function DynamicIsland:ClearExpandedContent()
-	if self._contentCleanup then
-		local cleanup = self._contentCleanup
-		self._contentCleanup = nil
-		cleanup()
-	end
-	if self._ownedContent then
-		self._ownedContent:Destroy()
-		self._ownedContent = nil
-	end
-	if self._userContent then
-		self._userContent.Parent = nil
-		self._userContent = nil
-	end
+    if self._contentCleanup then local c = self._contentCleanup; self._contentCleanup = nil; c() end
+    if self._ownedContent then self._ownedContent:Destroy(); self._ownedContent = nil end
+    if self._userContent  then self._userContent.Parent = nil; self._userContent = nil end
 end
-
--- content: a GuiObject (stretched to fill the padded area; not destroyed on replace)
---          or function(container: Frame, island) -> (() -> ())?  (container is destroyed on replace;
---          the optional returned function is called first, for disconnecting your own connections)
 function DynamicIsland:SetExpandedContent(content, expandedSize)
-	self:ClearExpandedContent()
-	local holder = self._contentHolder
-
-	if typeof(content) == "function" then
-		local box = create("Frame", {
-			Name = "Custom",
-			BackgroundTransparency = 1,
-			BorderSizePixel = 0,
-			Size = UDim2.fromScale(1, 1),
-		}, holder)
-		self._ownedContent = box
-		local cleanup = content(box, self)
-		if typeof(cleanup) == "function" then
-			self._contentCleanup = cleanup
-		end
-	elseif typeof(content) == "Instance" and content:IsA("GuiObject") then
-		content.AnchorPoint = Vector2.zero
-		content.Position = UDim2.fromScale(0, 0)
-		content.Size = UDim2.fromScale(1, 1)
-		content.Parent = holder
-		self._userContent = content
-	end
-
-	if expandedSize then
-		self:SetExpandedSize(expandedSize)
-	end
+    self:ClearExpandedContent(); local holder = self._contentHolder
+    if typeof(content) == "function" then
+        local box = create("Frame",{Name="Custom",BackgroundTransparency=1,BorderSizePixel=0,Size=UDim2.fromScale(1,1)},holder)
+        self._ownedContent = box; local cleanup = content(box,self)
+        if typeof(cleanup) == "function" then self._contentCleanup = cleanup end
+    elseif typeof(content) == "Instance" and content:IsA("GuiObject") then
+        content.AnchorPoint = Vector2.zero; content.Position = UDim2.fromScale(0,0)
+        content.Size = UDim2.fromScale(1,1); content.Parent = holder; self._userContent = content
+    end
+    if expandedSize then self:SetExpandedSize(expandedSize) end
 end
-
 function DynamicIsland:SetExpandedSize(size)
-	self._primarySize = size
-	if self._notifActive then
-		return
-	end
-	self._expandedSize = size
-	self._expandedLayer.Size = size
-	if self._state == "Expanded" then
-		self:_goto("Expanded", true)
-	end
+    self._primarySize = size
+    if self._notifActive then return end
+    self._expandedSize = size; self._expandedLayer.Size = size
+    if self._state == "Expanded" then self:_goto("Expanded",true) end
 end
-
-----------------------------------------------------------------------
--- Public: buttons
-----------------------------------------------------------------------
-
--- props: Name, Text, TextSize, TextColor3, Font, Size, Position, AnchorPoint, LayoutOrder,
---        BackgroundColor3, HoverColor, CornerRadius (UDim), Parent, Callback
 function DynamicIsland:CreateButton(props)
-	props = props or {}
-	local button = create("TextButton", {
-		Name = props.Name or "Button",
-		AutoButtonColor = false,
-		Text = props.Text or "",
-		Font = props.Font or self._config.Font,
-		TextSize = props.TextSize or 16,
-		TextColor3 = props.TextColor3 or self._config.TextColor,
-		BackgroundColor3 = props.BackgroundColor3 or SURFACE,
-		BorderSizePixel = 0,
-		Size = props.Size or UDim2.fromOffset(44, 44),
-		Position = props.Position or UDim2.new(),
-		AnchorPoint = props.AnchorPoint or Vector2.zero,
-		LayoutOrder = props.LayoutOrder or 0,
-	}, props.Parent)
-	create("UICorner", { CornerRadius = props.CornerRadius or UDim.new(1, 0) }, button)
-
-	if props.Callback then
-		button.Activated:Connect(props.Callback)
-	end
-	DynamicIsland.AddHoverEffect(button, { HoverColor = props.HoverColor })
-	return button
+    props = props or {}
+    local button = create("TextButton",{
+        Name = props.Name or "Button", AutoButtonColor = false,
+        Text = props.Text or "", Font = props.Font or self._config.Font,
+        TextSize = props.TextSize or 16, TextColor3 = props.TextColor3 or self._config.TextColor,
+        BackgroundColor3 = props.BackgroundColor3 or SURFACE, BorderSizePixel = 0,
+        Size = props.Size or UDim2.fromOffset(44,44), Position = props.Position or UDim2.new(),
+        AnchorPoint = props.AnchorPoint or Vector2.zero, LayoutOrder = props.LayoutOrder or 0,
+    }, props.Parent)
+    create("UICorner",{CornerRadius = props.CornerRadius or UDim.new(1,0)},button)
+    if props.Callback then button.Activated:Connect(props.Callback) end
+    DynamicIsland.AddHoverEffect(button,{HoverColor=props.HoverColor})
+    return button
 end
-
-----------------------------------------------------------------------
--- Preset: delivery tracker (iOS Live Activity style)
-----------------------------------------------------------------------
-
-local NODE_SIZE = 32
-local BAR_HEIGHT = 24
-
-local DEFAULT_STEPS = {
-	{ Glyph = "📦" },
-	{ Glyph = "🚗" },
-	{ Glyph = "🏠" },
-}
-
--- Centered icon: an ImageLabel when you pass an asset id, otherwise a text glyph.
-local function addIcon(parent, image, glyph, size, color)
-	if image and image ~= "" then
-		return create("ImageLabel", {
-			Name = "Icon",
-			AnchorPoint = Vector2.new(0.5, 0.5),
-			Position = UDim2.fromScale(0.5, 0.5),
-			Size = UDim2.fromOffset(size, size),
-			BackgroundTransparency = 1,
-			ScaleType = Enum.ScaleType.Fit,
-			Image = image,
-			ImageColor3 = color or WHITE,
-		}, parent)
-	end
-	return create("TextLabel", {
-		Name = "Icon",
-		Size = UDim2.fromScale(1, 1),
-		BackgroundTransparency = 1,
-		Font = Enum.Font.GothamMedium,
-		TextSize = math.floor(size * 0.85),
-		TextColor3 = color or WHITE,
-		Text = glyph or "",
-	}, parent)
+local NODE_SIZE = 32; local BAR_HEIGHT = 24
+local DEFAULT_STEPS = {{Glyph="📦"},{Glyph="🚗"},{Glyph="🏠"}}
+local function addIcon(parent,image,glyph,size,color)
+    if image and image ~= "" then
+        return create("ImageLabel",{Name="Icon",AnchorPoint=Vector2.new(0.5,0.5),Position=UDim2.fromScale(0.5,0.5),Size=UDim2.fromOffset(size,size),BackgroundTransparency=1,ScaleType=Enum.ScaleType.Fit,Image=image,ImageColor3=color or WHITE},parent)
+    end
+    return create("TextLabel",{Name="Icon",Size=UDim2.fromScale(1,1),BackgroundTransparency=1,Font=Enum.Font.GothamMedium,TextSize=math.floor(size*0.85),TextColor3=color or WHITE,Text=glyph or ""},parent)
 end
-
--- The fill ends exactly at the centre of the node that matches `alpha`.
-local function fillSize(alpha)
-	return UDim2.new(alpha, NODE_SIZE * (0.5 - alpha), 1, 0)
+local function fillSize(alpha) return UDim2.new(alpha, NODE_SIZE*(0.5-alpha), 1, 0) end
+local function buildDeliveryTracker(island,box,options,controller)
+    local color = options.Color or Color3.fromRGB(187,107,242)
+    local black = Color3.new(0,0,0); local trackColor = color:Lerp(black,0.58); local offColor = color:Lerp(black,0.42)
+    local steps = options.Steps or DEFAULT_STEPS; local count = #steps; local progress = math.clamp(options.Progress or 0,0,1)
+    local title = create("TextLabel",{Name="Title",BackgroundTransparency=1,Size=UDim2.new(1,0,0,22),Font=Enum.Font.GothamMedium,TextSize=16,TextColor3=color:Lerp(WHITE,0.15),TextXAlignment=Enum.TextXAlignment.Left,TextTruncate=Enum.TextTruncate.AtEnd,Text=options.Title or ""},box)
+    local track = create("Frame",{Name="Progress",BackgroundTransparency=1,Position=UDim2.fromOffset(0,32),Size=UDim2.new(1,0,0,NODE_SIZE)},box)
+    local bar = create("Frame",{Name="Bar",AnchorPoint=Vector2.new(0,0.5),Position=UDim2.fromScale(0,0.5),Size=UDim2.new(1,0,0,BAR_HEIGHT),BackgroundColor3=trackColor,BorderSizePixel=0,ZIndex=1},track)
+    create("UICorner",{CornerRadius=UDim.new(1,0)},bar)
+    local fill = create("Frame",{Name="Fill",BackgroundColor3=color,BorderSizePixel=0,Size=fillSize(progress)},bar)
+    create("UICorner",{CornerRadius=UDim.new(1,0)},fill)
+    local nodes = {}
+    for index,step in steps do
+        local alpha = if count > 1 then (index-1)/(count-1) else 0
+        local node = create("Frame",{Name="Node"..index,AnchorPoint=Vector2.new(0.5,0.5),Position=UDim2.new(alpha,NODE_SIZE*(0.5-alpha),0.5,0),Size=UDim2.fromOffset(NODE_SIZE,NODE_SIZE),BackgroundColor3=offColor,BorderSizePixel=0,ZIndex=2},track)
+        create("UICorner",{CornerRadius=UDim.new(1,0)},node); addIcon(node,step.Icon,step.Glyph,18); nodes[index]={Frame=node,Alpha=alpha}
+    end
+    local function renderNodes(animated)
+        for _,node in nodes do
+            local lit = progress >= node.Alpha - 0.001; local goal = if lit then color else offColor
+            if animated then TweenService:Create(node.Frame,TWEENS.Progress,{BackgroundColor3=goal}):Play()
+            else node.Frame.BackgroundColor3 = goal end
+        end
+    end
+    renderNodes(false)
+    local row = create("Frame",{Name="Contact",BackgroundTransparency=1,AnchorPoint=Vector2.new(0,1),Position=UDim2.fromScale(0,1),Size=UDim2.new(1,0,0,40)},box)
+    local avatar = create("ImageLabel",{Name="Avatar",BackgroundColor3=SURFACE,BorderSizePixel=0,Image=options.Avatar or "",ScaleType=Enum.ScaleType.Crop,Size=UDim2.fromOffset(40,40)},row)
+    create("UICorner",{CornerRadius=UDim.new(1,0)},avatar)
+    local name = create("TextLabel",{Name="Name",BackgroundTransparency=1,Position=UDim2.fromOffset(52,0),Size=UDim2.new(1,-(52+182),1,0),Font=Enum.Font.GothamMedium,TextSize=17,TextColor3=island._config.TextColor,TextXAlignment=Enum.TextXAlignment.Left,TextTruncate=Enum.TextTruncate.AtEnd,Text=options.ContactName or ""},row)
+    local buttons = create("Frame",{Name="Buttons",BackgroundTransparency=1,AnchorPoint=Vector2.new(1,0),Position=UDim2.fromScale(1,0),Size=UDim2.new(0,178,1,0)},row)
+    create("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,HorizontalAlignment=Enum.HorizontalAlignment.Right,VerticalAlignment=Enum.VerticalAlignment.Center,SortOrder=Enum.SortOrder.LayoutOrder,Padding=UDim.new(0,10)},buttons)
+    local function contactButton(order,buttonName,image,glyph,callback)
+        local button = island:CreateButton({Name=buttonName,Text="",Size=UDim2.fromOffset(84,40),BackgroundColor3=Color3.fromRGB(58,58,60),LayoutOrder=order,Parent=buttons,Callback=callback})
+        addIcon(button,image,glyph,20); return button
+    end
+    contactButton(1,"Call",options.CallIcon,"📞",options.OnCall)
+    contactButton(2,"Message",options.MessageIcon,"💬",options.OnMessage)
+    function controller.SetProgress(alpha)
+        progress = math.clamp(alpha,0,1); TweenService:Create(fill,TWEENS.Progress,{Size=fillSize(progress)}):Play(); renderNodes(true)
+    end
+    function controller.SetTitle(text) title.Text = text end
+    function controller.SetContact(info)
+        if info.Name then name.Text = info.Name end
+        if info.Avatar then avatar.Image = info.Avatar end
+    end
 end
-
-local function buildDeliveryTracker(island, box, options, controller)
-	local color = options.Color or Color3.fromRGB(187, 107, 242)
-	local black = Color3.new(0, 0, 0)
-	local trackColor = color:Lerp(black, 0.58)
-	local offColor = color:Lerp(black, 0.42)
-	local steps = options.Steps or DEFAULT_STEPS
-	local count = #steps
-	local progress = math.clamp(options.Progress or 0, 0, 1)
-
-	-- Title
-	local title = create("TextLabel", {
-		Name = "Title",
-		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 22),
-		Font = Enum.Font.GothamMedium,
-		TextSize = 16,
-		TextColor3 = color:Lerp(WHITE, 0.15),
-		TextXAlignment = Enum.TextXAlignment.Left,
-		TextTruncate = Enum.TextTruncate.AtEnd,
-		Text = options.Title or "",
-	}, box)
-
-	-- Progress bar + nodes
-	local track = create("Frame", {
-		Name = "Progress",
-		BackgroundTransparency = 1,
-		Position = UDim2.fromOffset(0, 32),
-		Size = UDim2.new(1, 0, 0, NODE_SIZE),
-	}, box)
-	local bar = create("Frame", {
-		Name = "Bar",
-		AnchorPoint = Vector2.new(0, 0.5),
-		Position = UDim2.fromScale(0, 0.5),
-		Size = UDim2.new(1, 0, 0, BAR_HEIGHT),
-		BackgroundColor3 = trackColor,
-		BorderSizePixel = 0,
-		ZIndex = 1,
-	}, track)
-	create("UICorner", { CornerRadius = UDim.new(1, 0) }, bar)
-	local fill = create("Frame", {
-		Name = "Fill",
-		BackgroundColor3 = color,
-		BorderSizePixel = 0,
-		Size = fillSize(progress),
-	}, bar)
-	create("UICorner", { CornerRadius = UDim.new(1, 0) }, fill)
-
-	local nodes = {}
-	for index, step in steps do
-		local alpha = if count > 1 then (index - 1) / (count - 1) else 0
-		local node = create("Frame", {
-			Name = "Node" .. index,
-			AnchorPoint = Vector2.new(0.5, 0.5),
-			Position = UDim2.new(alpha, NODE_SIZE * (0.5 - alpha), 0.5, 0),
-			Size = UDim2.fromOffset(NODE_SIZE, NODE_SIZE),
-			BackgroundColor3 = offColor,
-			BorderSizePixel = 0,
-			ZIndex = 2,
-		}, track)
-		create("UICorner", { CornerRadius = UDim.new(1, 0) }, node)
-		addIcon(node, step.Icon, step.Glyph, 18)
-		nodes[index] = { Frame = node, Alpha = alpha }
-	end
-
-	local function renderNodes(animated)
-		for _, node in nodes do
-			local lit = progress >= node.Alpha - 0.001
-			local goal = if lit then color else offColor
-			if animated then
-				TweenService:Create(node.Frame, TWEENS.Progress, { BackgroundColor3 = goal }):Play()
-			else
-				node.Frame.BackgroundColor3 = goal
-			end
-		end
-	end
-	renderNodes(false)
-
-	-- Contact row: avatar, name, call + message buttons
-	local row = create("Frame", {
-		Name = "Contact",
-		BackgroundTransparency = 1,
-		AnchorPoint = Vector2.new(0, 1),
-		Position = UDim2.fromScale(0, 1),
-		Size = UDim2.new(1, 0, 0, 40),
-	}, box)
-
-	local avatar = create("ImageLabel", {
-		Name = "Avatar",
-		BackgroundColor3 = SURFACE,
-		BorderSizePixel = 0,
-		Image = options.Avatar or "",
-		ScaleType = Enum.ScaleType.Crop,
-		Size = UDim2.fromOffset(40, 40),
-	}, row)
-	create("UICorner", { CornerRadius = UDim.new(1, 0) }, avatar)
-
-	local name = create("TextLabel", {
-		Name = "Name",
-		BackgroundTransparency = 1,
-		Position = UDim2.fromOffset(52, 0),
-		Size = UDim2.new(1, -(52 + 182), 1, 0),
-		Font = Enum.Font.GothamMedium,
-		TextSize = 17,
-		TextColor3 = island._config.TextColor,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		TextTruncate = Enum.TextTruncate.AtEnd,
-		Text = options.ContactName or "",
-	}, row)
-
-	local buttons = create("Frame", {
-		Name = "Buttons",
-		BackgroundTransparency = 1,
-		AnchorPoint = Vector2.new(1, 0),
-		Position = UDim2.fromScale(1, 0),
-		Size = UDim2.new(0, 178, 1, 0),
-	}, row)
-	create("UIListLayout", {
-		FillDirection = Enum.FillDirection.Horizontal,
-		HorizontalAlignment = Enum.HorizontalAlignment.Right,
-		VerticalAlignment = Enum.VerticalAlignment.Center,
-		SortOrder = Enum.SortOrder.LayoutOrder,
-		Padding = UDim.new(0, 10),
-	}, buttons)
-
-	local function contactButton(order, buttonName, image, glyph, callback)
-		local button = island:CreateButton({
-			Name = buttonName,
-			Text = "",
-			Size = UDim2.fromOffset(84, 40),
-			BackgroundColor3 = Color3.fromRGB(58, 58, 60),
-			LayoutOrder = order,
-			Parent = buttons,
-			Callback = callback,
-		})
-		addIcon(button, image, glyph, 20)
-		return button
-	end
-	contactButton(1, "Call", options.CallIcon, "📞", options.OnCall)
-	contactButton(2, "Message", options.MessageIcon, "💬", options.OnMessage)
-
-	-- Controller returned to the caller
-	function controller.SetProgress(alpha)
-		progress = math.clamp(alpha, 0, 1)
-		TweenService:Create(fill, TWEENS.Progress, { Size = fillSize(progress) }):Play()
-		renderNodes(true)
-	end
-
-	function controller.SetTitle(text)
-		title.Text = text
-	end
-
-	function controller.SetContact(info)
-		if info.Name then
-			name.Text = info.Name
-		end
-		if info.Avatar then
-			avatar.Image = info.Avatar
-		end
-	end
-end
-
--- options:
---   Title        string, e.g. "Picking up order"
---   Progress     0-1 along the bar (nodes are spaced evenly, first at 0, last at 1)
---   Color        accent color (default purple)
---   Steps        { { Glyph = "📦", Icon = "rbxassetid://..." }, ... }  (default: box, car, house)
---   ContactName, Avatar (image id), CallIcon, MessageIcon (image ids)
---   OnCall(), OnMessage()
--- returns controller: SetProgress(alpha), SetTitle(text), SetContact({Name, Avatar})
 function DynamicIsland:SetDeliveryTracker(options)
-	options = options or {}
-	local controller = {}
-	self:SetExpandedContent(function(box)
-		buildDeliveryTracker(self, box, options, controller)
-	end, UDim2.fromOffset(self._config.ExpandedSize.X.Offset, 170))
-	return controller
+    options = options or {}; local controller = {}
+    self:SetExpandedContent(function(box) buildDeliveryTracker(self,box,options,controller) end, UDim2.fromOffset(self._config.ExpandedSize.X.Offset,170))
+    return controller
 end
-
-----------------------------------------------------------------------
--- Preset: notification / game alert
-----------------------------------------------------------------------
-
-local function buildNotification(island, holder, options)
-	local config = island._config
-	local textX = options.Icon and 56 or 0
-
-	if options.Icon then
-		local icon = create("ImageLabel", {
-			Name = "Icon",
-			BackgroundColor3 = options.IconBackground or SURFACE,
-			BorderSizePixel = 0,
-			Image = options.Icon,
-			ScaleType = Enum.ScaleType.Crop,
-			Size = UDim2.fromOffset(44, 44),
-		}, holder)
-		create("UICorner", { CornerRadius = UDim.new(0, 12) }, icon)
-	end
-
-	create("TextLabel", {
-		Name = "Title",
-		BackgroundTransparency = 1,
-		Position = UDim2.fromOffset(textX, 0),
-		Size = UDim2.new(1, -textX, 0, 22),
-		Font = Enum.Font.GothamBold,
-		TextSize = 16,
-		TextColor3 = config.TextColor,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		TextTruncate = Enum.TextTruncate.AtEnd,
-		Text = options.Title or "",
-	}, holder)
-
-	create("TextLabel", {
-		Name = "Message",
-		BackgroundTransparency = 1,
-		Position = UDim2.fromOffset(textX, 24),
-		Size = UDim2.new(1, -textX, 0, 38),
-		Font = Enum.Font.Gotham,
-		TextSize = 14,
-		TextColor3 = SECONDARY_TEXT,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		TextYAlignment = Enum.TextYAlignment.Top,
-		TextWrapped = true,
-		TextTruncate = Enum.TextTruncate.AtEnd,
-		Text = options.Message or "",
-	}, holder)
-
-	if options.ButtonText then
-		island:CreateButton({
-			Name = "Action",
-			Text = options.ButtonText,
-			TextSize = 14,
-			BackgroundColor3 = config.AccentColor,
-			AnchorPoint = Vector2.new(1, 1),
-			Position = UDim2.fromScale(1, 1),
-			Size = UDim2.fromOffset(120, 34),
-			Parent = holder,
-			Callback = function()
-				if options.OnButton then
-					options.OnButton()
-				end
-				island:Collapse()
-			end,
-		})
-	end
+local function buildNotification(island,holder,options)
+    local config = island._config; local textX = options.Icon and 56 or 0
+    if options.Icon then
+        local icon = create("ImageLabel",{Name="Icon",BackgroundColor3=options.IconBackground or SURFACE,BorderSizePixel=0,Image=options.Icon,ScaleType=Enum.ScaleType.Crop,Size=UDim2.fromOffset(44,44)},holder)
+        create("UICorner",{CornerRadius=UDim.new(0,12)},icon)
+    end
+    create("TextLabel",{Name="Title",BackgroundTransparency=1,Position=UDim2.fromOffset(textX,0),Size=UDim2.new(1,-textX,0,22),Font=Enum.Font.GothamBold,TextSize=16,TextColor3=config.TextColor,TextXAlignment=Enum.TextXAlignment.Left,TextTruncate=Enum.TextTruncate.AtEnd,Text=options.Title or ""},holder)
+    create("TextLabel",{Name="Message",BackgroundTransparency=1,Position=UDim2.fromOffset(textX,24),Size=UDim2.new(1,-textX,0,38),Font=Enum.Font.Gotham,TextSize=14,TextColor3=SECONDARY_TEXT,TextXAlignment=Enum.TextXAlignment.Left,TextYAlignment=Enum.TextYAlignment.Top,TextWrapped=true,TextTruncate=Enum.TextTruncate.AtEnd,Text=options.Message or ""},holder)
+    if options.ButtonText then
+        island:CreateButton({Name="Action",Text=options.ButtonText,TextSize=14,BackgroundColor3=config.AccentColor,AnchorPoint=Vector2.new(1,1),Position=UDim2.fromScale(1,1),Size=UDim2.fromOffset(120,34),Parent=holder,Callback=function() if options.OnButton then options.OnButton() end; island:Collapse() end})
+    end
 end
-
--- options: Title, Message, Icon (image id), IconBackground, ButtonText, OnButton(),
---          Duration (seconds, default 4, 0 = stay until dismissed)
--- Shows over whatever the island was doing and returns to it afterwards.
 function DynamicIsland:Notify(options)
-	if self._destroyed then
-		return
-	end
-	options = options or {}
-	local hasButton = options.ButtonText ~= nil
-	local size = UDim2.fromOffset(self._config.ExpandedSize.X.Offset, if hasButton then 146 else 100)
-
-	if not self._notifActive then
-		self._returnState = self._state
-	end
-	clearHolder(self._notifHolder)
-	buildNotification(self, self._notifHolder, options)
-
-	self._notifActive = true
-	self._contentHolder.Visible = false
-	self._notifHolder.Visible = true
-	self._expandedSize = size
-	self._expandedLayer.Size = size
-
-	local previous = self._state
-	self._notifToken += 1
-	local token = self._notifToken
-	self:_goto("Expanded", true)
-	if previous ~= "Expanded" then
-		self._stateChangedEvent:Fire("Expanded", previous)
-	end
-
-	local duration = options.Duration or 4
-	if duration > 0 then
-		task.delay(duration, function()
-			if self._destroyed or self._notifToken ~= token or not self._notifActive then
-				return
-			end
-			if self._returnState == "Expanded" then
-				self:_endNotification()
-				self:_goto("Expanded", true)
-			elseif self._state == "Expanded" then
-				self:SetState(self._returnState or "Compact")
-			end
-		end)
-	end
+    if self._destroyed then return end; options = options or {}
+    local hasButton = options.ButtonText ~= nil
+    local size = UDim2.fromOffset(self._config.ExpandedSize.X.Offset, if hasButton then 146 else 100)
+    if not self._notifActive then self._returnState = self._state end
+    clearHolder(self._notifHolder); buildNotification(self,self._notifHolder,options)
+    self._notifActive = true; self._contentHolder.Visible = false; self._notifHolder.Visible = true
+    self._expandedSize = size; self._expandedLayer.Size = size
+    local previous = self._state; self._notifToken += 1; local token = self._notifToken
+    self:_goto("Expanded",true)
+    if previous ~= "Expanded" then self._stateChangedEvent:Fire("Expanded",previous) end
+    local duration = options.Duration or 4
+    if duration > 0 then
+        task.delay(duration, function()
+            if self._destroyed or self._notifToken ~= token or not self._notifActive then return end
+            if self._returnState == "Expanded" then self:_endNotification(); self:_goto("Expanded",true)
+            elseif self._state == "Expanded" then self:SetState(self._returnState or "Compact") end
+        end)
+    end
 end
-
-----------------------------------------------------------------------
--- Cleanup
-----------------------------------------------------------------------
-
 function DynamicIsland:Destroy()
-	if self._destroyed then
-		return
-	end
-	self._destroyed = true
-	self._transitionId += 1
-	self:_cancelTweens()
-
-	for _, connection in self._connections do
-		connection:Disconnect()
-	end
-	table.clear(self._connections)
-
-	self:ClearExpandedContent()
-	for _, slot in self._slots do
-		if slot.Custom then
-			slot.Custom.Parent = nil
-			slot.Custom = nil
-		end
-	end
-
-	self._holder:Destroy()
-	self._stateChangedEvent:Destroy()
-	self._activatedEvent:Destroy()
+    if self._destroyed then return end; self._destroyed = true; self._transitionId += 1; self:_cancelTweens()
+    for _,connection in self._connections do connection:Disconnect() end; table.clear(self._connections)
+    self:ClearExpandedContent()
+    for _,slot in self._slots do if slot.Custom then slot.Custom.Parent = nil; slot.Custom = nil end end
+    self._holder:Destroy(); self._stateChangedEvent:Destroy(); self._activatedEvent:Destroy()
 end
-
-    return DynamicIsland
+return DynamicIsland
 end)()
 
 -- ════════════════════════════════════════════
---  WORD DATABASE  (identical to v3.8)
+--  WORD DATABASE
 -- ════════════════════════════════════════════
 local function firstChar(str)
     if #str == 0 then return nil end
     local b = str:byte(1)
-    if     b >= 0xF0 then return str:sub(1, 4)
-    elseif b >= 0xE0 then return str:sub(1, 3)
-    elseif b >= 0xC0 then return str:sub(1, 2)
-    else                   return str:sub(1, 1) end
+    if     b >= 0xF0 then return str:sub(1,4)
+    elseif b >= 0xE0 then return str:sub(1,3)
+    elseif b >= 0xC0 then return str:sub(1,2)
+    else                   return str:sub(1,1) end
 end
-
 local function isThaiOnlyWord(word)
     local len = #word
     if len == 0 or len % 3 ~= 0 then return false end
     for i = 1, len, 3 do
-        local b1, b2, b3 = word:byte(i, i + 2)
+        local b1,b2,b3 = word:byte(i, i+2)
         if b1 ~= 0xE0 or (b2 ~= 0xB8 and b2 ~= 0xB9) or not b3 or b3 < 0x80 or b3 > 0xBF then return false end
     end
     return true
 end
-
 local function buildDB(text)
     local db = {}
     for line in text:gmatch("[^\n\r]+") do
@@ -1413,7 +631,6 @@ local function buildDB(text)
     end
     return db
 end
-
 local function buildFreqDB(text)
     local freq = {}
     for line in text:gmatch("[^\n\r]+") do
@@ -1422,13 +639,12 @@ local function buildFreqDB(text)
     end
     return freq
 end
-
 local function loadWordDB()
     if isfile and isfile(CACHE_PATH) then
         local ok, cached = pcall(readfile, CACHE_PATH)
         if ok and cached and #cached > 500 then
             local db = buildDB(cached)
-            local n = 0; for _, v in pairs(db) do n = n + #v end
+            local n = 0; for _,v in pairs(db) do n = n + #v end
             if n > 1000 then return db end
         end
     end
@@ -1437,7 +653,6 @@ local function loadWordDB()
     if writefile then pcall(writefile, CACHE_PATH, body) end
     return buildDB(body)
 end
-
 local function loadFreqDB()
     if isfile and isfile(FREQ_CACHE_PATH) then
         local ok, cached = pcall(readfile, FREQ_CACHE_PATH)
@@ -1452,7 +667,6 @@ local function loadFreqDB()
     if writefile then pcall(writefile, FREQ_CACHE_PATH, body) end
     return buildFreqDB(body)
 end
-
 local WORD_DB   = loadWordDB()
 local WORD_FREQ = loadFreqDB()
 
@@ -1462,7 +676,7 @@ local WORD_FREQ = loadFreqDB()
 local blacklisted        = {}
 local usedWords          = {}
 local usedCount          = 0
-local isAutoFillON       = false
+local isAutoFillON       = true
 local isTyping           = false
 local lastWord           = ""
 local currentSuggestions = {}
@@ -1491,14 +705,14 @@ local function getSuggestions(prefix)
     if not bucket then return out end
     local minChars = CFG.MIN_SUGGEST_CHARS
     for _, w in ipairs(bucket) do
-        if #w > plen and w:sub(1, plen) == prefix
+        if #w > plen and w:sub(1,plen) == prefix
             and not blacklisted[w] and not usedWords[w]
             and utf8Len(w) >= minChars then
             table.insert(out, w)
         end
     end
-    table.sort(out, function(a, b)
-        local fa, fb = WORD_FREQ[a] or 0, WORD_FREQ[b] or 0
+    table.sort(out, function(a,b)
+        local fa,fb = WORD_FREQ[a] or 0, WORD_FREQ[b] or 0
         if fa ~= fb then return fa > fb end
         return #a < #b
     end)
@@ -1520,35 +734,33 @@ screenGui.ZIndexBehavior  = Enum.ZIndexBehavior.Sibling
 screenGui.DisplayOrder    = 10
 
 local island = DynamicIsland.new(screenGui, {
-    CompactSize          = UDim2.fromOffset(300, 44),
-    MinimalSize          = UDim2.fromOffset(38, 38),
-    ExpandedSize         = UDim2.fromOffset(310, 228),
-    ExpandedCornerRadius = 32,
-    ExpandedPadding      = 16,
-    TopOffset            = 16,
-    SlotPadding          = 14,
-    MinimalSide          = "Right",
-    MinimalGap           = 8,
-    BackgroundColor      = COLORS.bg,
-    TextColor            = COLORS.text,
-    AccentColor          = COLORS.accent,
-    Font                 = Enum.Font.GothamMedium,
-    ZIndex               = 100,
-    InitialState         = "Hidden",   -- animate in after setup
-    ExpandOnClick        = true,
+    CompactSize            = UDim2.fromOffset(300, 44),
+    MinimalSize            = UDim2.fromOffset(38, 38),
+    ExpandedSize           = UDim2.fromOffset(310, 248),
+    ExpandedCornerRadius   = 32,
+    ExpandedPadding        = 16,
+    TopOffset              = 16,
+    SlotPadding            = 14,
+    MinimalSide            = "Right",
+    MinimalGap             = 8,
+    BackgroundColor        = COLORS.bg,
+    TextColor              = COLORS.text,
+    AccentColor            = COLORS.accent,
+    Font                   = Enum.Font.GothamMedium,
+    ZIndex                 = 100,
+    InitialState           = "Hidden",
+    ExpandOnClick          = true,
     CollapseOnOutsideClick = true,
-    PressEffect          = true,
+    PressEffect            = true,
 })
 
 -- ════════════════════════════════════════════
---  EXPANDED CONTENT  (built once, kept alive)
+--  EXPANDED CONTENT
 -- ════════════════════════════════════════════
--- Dynamic refs updated by showCurrent() and doAutoFill()
 local expSubtitle, expWord, expHint, expLenLabel
 local expSpeedVal, expSliderFill, expSliderBtn, expSliderBg
-local expAutoBtn
+local expAutoBtn, expRankBtn
 
--- Root frame (filled by DynamicIsland into the padded content holder)
 local expandedFrame = Instance.new("Frame")
 expandedFrame.BackgroundTransparency = 1
 expandedFrame.BorderSizePixel        = 0
@@ -1559,21 +771,19 @@ expList.SortOrder           = Enum.SortOrder.LayoutOrder
 expList.HorizontalAlignment = Enum.HorizontalAlignment.Center
 expList.Padding             = UDim.new(0, 6)
 
--- ── Subtitle ─────────────────────────────────
 expSubtitle = Instance.new("TextLabel", expandedFrame)
-expSubtitle.LayoutOrder          = 1
-expSubtitle.Size                 = UDim2.new(1, 0, 0, 13)
+expSubtitle.LayoutOrder            = 1
+expSubtitle.Size                   = UDim2.new(1,0,0,13)
 expSubtitle.BackgroundTransparency = 1
-expSubtitle.Font                 = Enum.Font.Gotham
-expSubtitle.TextSize             = 11
-expSubtitle.TextColor3           = COLORS.dim
-expSubtitle.TextXAlignment       = Enum.TextXAlignment.Left
-expSubtitle.Text                 = "สถานะ"
+expSubtitle.Font                   = Enum.Font.Gotham
+expSubtitle.TextSize               = 11
+expSubtitle.TextColor3             = COLORS.dim
+expSubtitle.TextXAlignment         = Enum.TextXAlignment.Left
+expSubtitle.Text                   = "สถานะ"
 
--- ── Main word ────────────────────────────────
 expWord = Instance.new("TextLabel", expandedFrame)
 expWord.LayoutOrder            = 2
-expWord.Size                   = UDim2.new(1, 0, 0, 26)
+expWord.Size                   = UDim2.new(1,0,0,26)
 expWord.BackgroundTransparency = 1
 expWord.Font                   = Enum.Font.GothamBold
 expWord.TextSize               = 19
@@ -1581,10 +791,9 @@ expWord.TextColor3             = COLORS.text
 expWord.TextXAlignment         = Enum.TextXAlignment.Left
 expWord.Text                   = "รอคำจากเกม..."
 
--- ── Hint chip ────────────────────────────────
 expHint = Instance.new("TextLabel", expandedFrame)
 expHint.LayoutOrder            = 3
-expHint.Size                   = UDim2.new(1, 0, 0, 12)
+expHint.Size                   = UDim2.new(1,0,0,12)
 expHint.BackgroundTransparency = 1
 expHint.Font                   = Enum.Font.GothamBold
 expHint.TextSize               = 11
@@ -1592,52 +801,49 @@ expHint.TextColor3             = COLORS.auto_txt
 expHint.TextXAlignment         = Enum.TextXAlignment.Left
 expHint.Text                   = ""
 
--- ── Divider ──────────────────────────────────
 local expDivider = Instance.new("Frame", expandedFrame)
 expDivider.LayoutOrder      = 4
-expDivider.Size             = UDim2.new(1, 0, 0, 1)
+expDivider.Size             = UDim2.new(1,0,0,1)
 expDivider.BackgroundColor3 = COLORS.border
 expDivider.BorderSizePixel  = 0
 
--- ── Length row ───────────────────────────────
 local lenRow = Instance.new("Frame", expandedFrame)
 lenRow.LayoutOrder            = 5
-lenRow.Size                   = UDim2.new(1, 0, 0, 28)
+lenRow.Size                   = UDim2.new(1,0,0,28)
 lenRow.BackgroundTransparency = 1
 
 local lenTitle = Instance.new("TextLabel", lenRow)
-lenTitle.Size            = UDim2.new(1, -98, 1, 0)
-lenTitle.Position        = UDim2.fromOffset(0, 0)
+lenTitle.Size                   = UDim2.new(1,-98,1,0)
+lenTitle.Position               = UDim2.fromOffset(0,0)
 lenTitle.BackgroundTransparency = 1
-lenTitle.Font            = Enum.Font.Gotham
-lenTitle.TextSize        = 11
-lenTitle.TextColor3      = COLORS.dim
-lenTitle.TextXAlignment  = Enum.TextXAlignment.Left
-lenTitle.Text            = "ความยาวขั้นต่ำ"
+lenTitle.Font                   = Enum.Font.Gotham
+lenTitle.TextSize               = 11
+lenTitle.TextColor3             = COLORS.dim
+lenTitle.TextXAlignment         = Enum.TextXAlignment.Left
+lenTitle.Text                   = "ความยาวขั้นต่ำ"
 
--- controls (right-aligned within lenRow)
 local lenCtrl = Instance.new("Frame", lenRow)
-lenCtrl.AnchorPoint         = Vector2.new(1, 0.5)
-lenCtrl.Position            = UDim2.new(1, 0, 0.5, 0)
-lenCtrl.Size                = UDim2.fromOffset(94, 28)
+lenCtrl.AnchorPoint            = Vector2.new(1,0.5)
+lenCtrl.Position               = UDim2.new(1,0,0.5,0)
+lenCtrl.Size                   = UDim2.fromOffset(94,28)
 lenCtrl.BackgroundTransparency = 1
 
 local lenCtrlList = Instance.new("UIListLayout", lenCtrl)
-lenCtrlList.FillDirection        = Enum.FillDirection.Horizontal
-lenCtrlList.HorizontalAlignment  = Enum.HorizontalAlignment.Right
-lenCtrlList.VerticalAlignment    = Enum.VerticalAlignment.Center
-lenCtrlList.SortOrder            = Enum.SortOrder.LayoutOrder
-lenCtrlList.Padding              = UDim.new(0, 4)
+lenCtrlList.FillDirection       = Enum.FillDirection.Horizontal
+lenCtrlList.HorizontalAlignment = Enum.HorizontalAlignment.Right
+lenCtrlList.VerticalAlignment   = Enum.VerticalAlignment.Center
+lenCtrlList.SortOrder           = Enum.SortOrder.LayoutOrder
+lenCtrlList.Padding             = UDim.new(0,4)
 
--- forward-declare refreshSuggestions used in button callbacks (defined later)
 local refreshSuggestions
+local showCurrent
 
 local lenMinusBtn = island:CreateButton({
-    Name = "LenMinus", Text = "−", TextSize = 16,
-    Size = UDim2.fromOffset(28, 28), LayoutOrder = 1,
-    BackgroundColor3 = COLORS.set_bg, TextColor3 = COLORS.set_txt,
-    CornerRadius = UDim.new(1, 0), Parent = lenCtrl,
-    Callback = function()
+    Name="LenMinus", Text="−", TextSize=16,
+    Size=UDim2.fromOffset(28,28), LayoutOrder=1,
+    BackgroundColor3=COLORS.set_bg, TextColor3=COLORS.set_txt,
+    CornerRadius=UDim.new(1,0), Parent=lenCtrl,
+    Callback=function()
         CFG.MIN_SUGGEST_CHARS = math.clamp(CFG.MIN_SUGGEST_CHARS - 1, 1, 15)
         if expLenLabel then expLenLabel.Text = tostring(CFG.MIN_SUGGEST_CHARS) end
         if refreshSuggestions then refreshSuggestions(lastWord) end
@@ -1646,7 +852,7 @@ local lenMinusBtn = island:CreateButton({
 
 expLenLabel = Instance.new("TextLabel", lenCtrl)
 expLenLabel.LayoutOrder            = 2
-expLenLabel.Size                   = UDim2.fromOffset(22, 28)
+expLenLabel.Size                   = UDim2.fromOffset(22,28)
 expLenLabel.BackgroundTransparency = 1
 expLenLabel.Font                   = Enum.Font.GothamBold
 expLenLabel.TextSize               = 13
@@ -1654,78 +860,76 @@ expLenLabel.TextColor3             = COLORS.text
 expLenLabel.Text                   = tostring(CFG.MIN_SUGGEST_CHARS)
 
 local lenPlusBtn = island:CreateButton({
-    Name = "LenPlus", Text = "+", TextSize = 16,
-    Size = UDim2.fromOffset(28, 28), LayoutOrder = 3,
-    BackgroundColor3 = COLORS.set_bg, TextColor3 = COLORS.set_txt,
-    CornerRadius = UDim.new(1, 0), Parent = lenCtrl,
-    Callback = function()
+    Name="LenPlus", Text="+", TextSize=16,
+    Size=UDim2.fromOffset(28,28), LayoutOrder=3,
+    BackgroundColor3=COLORS.set_bg, TextColor3=COLORS.set_txt,
+    CornerRadius=UDim.new(1,0), Parent=lenCtrl,
+    Callback=function()
         CFG.MIN_SUGGEST_CHARS = math.clamp(CFG.MIN_SUGGEST_CHARS + 1, 1, 15)
         if expLenLabel then expLenLabel.Text = tostring(CFG.MIN_SUGGEST_CHARS) end
         if refreshSuggestions then refreshSuggestions(lastWord) end
     end,
 })
 
--- ── Speed section ─────────────────────────────
+-- Speed section
 local speedSection = Instance.new("Frame", expandedFrame)
 speedSection.LayoutOrder            = 6
-speedSection.Size                   = UDim2.new(1, 0, 0, 34)
+speedSection.Size                   = UDim2.new(1,0,0,34)
 speedSection.BackgroundTransparency = 1
 
--- title + value on same row
 local speedTitleRow = Instance.new("Frame", speedSection)
-speedTitleRow.Size                   = UDim2.new(1, 0, 0, 13)
-speedTitleRow.Position               = UDim2.fromOffset(0, 0)
+speedTitleRow.Size                   = UDim2.new(1,0,0,13)
+speedTitleRow.Position               = UDim2.fromOffset(0,0)
 speedTitleRow.BackgroundTransparency = 1
 
 local speedTitleLbl = Instance.new("TextLabel", speedTitleRow)
-speedTitleLbl.Size            = UDim2.new(0.6, 0, 1, 0)
+speedTitleLbl.Size                   = UDim2.new(0.6,0,1,0)
 speedTitleLbl.BackgroundTransparency = 1
-speedTitleLbl.Font            = Enum.Font.Gotham
-speedTitleLbl.TextSize        = 11
-speedTitleLbl.TextColor3      = COLORS.dim
-speedTitleLbl.TextXAlignment  = Enum.TextXAlignment.Left
-speedTitleLbl.Text            = "ความเร็วพิมพ์"
+speedTitleLbl.Font                   = Enum.Font.Gotham
+speedTitleLbl.TextSize               = 11
+speedTitleLbl.TextColor3             = COLORS.dim
+speedTitleLbl.TextXAlignment         = Enum.TextXAlignment.Left
+speedTitleLbl.Text                   = "ความเร็วพิมพ์"
 
 expSpeedVal = Instance.new("TextLabel", speedTitleRow)
-expSpeedVal.AnchorPoint           = Vector2.new(1, 0)
-expSpeedVal.Position              = UDim2.fromScale(1, 0)
-expSpeedVal.Size                  = UDim2.new(0.4, 0, 1, 0)
+expSpeedVal.AnchorPoint            = Vector2.new(1,0)
+expSpeedVal.Position               = UDim2.fromScale(1,0)
+expSpeedVal.Size                   = UDim2.new(0.4,0,1,0)
 expSpeedVal.BackgroundTransparency = 1
-expSpeedVal.Font                  = Enum.Font.GothamBold
-expSpeedVal.TextSize              = 11
-expSpeedVal.TextColor3            = COLORS.accent
-expSpeedVal.TextXAlignment        = Enum.TextXAlignment.Right
-expSpeedVal.Text                  = string.format("%.2fs/ตัว", CURRENT_SPEED_DELAY)
+expSpeedVal.Font                   = Enum.Font.GothamBold
+expSpeedVal.TextSize               = 11
+expSpeedVal.TextColor3             = COLORS.accent
+expSpeedVal.TextXAlignment         = Enum.TextXAlignment.Right
+expSpeedVal.Text                   = string.format("%.2fs/ตัว", CURRENT_SPEED_DELAY)
 
--- slider track
 expSliderBg = Instance.new("Frame", speedSection)
-expSliderBg.Position        = UDim2.new(0, 0, 0, 18)
-expSliderBg.Size            = UDim2.new(1, 0, 0, 8)
+expSliderBg.Position         = UDim2.new(0,0,0,18)
+expSliderBg.Size             = UDim2.new(1,0,0,8)
 expSliderBg.BackgroundColor3 = Color3.fromHex("1E1E1E")
-expSliderBg.BorderSizePixel = 0
-Instance.new("UICorner", expSliderBg).CornerRadius = UDim.new(1, 0)
-Instance.new("UIStroke", expSliderBg).Color = COLORS.border
+expSliderBg.BorderSizePixel  = 0
+Instance.new("UICorner", expSliderBg).CornerRadius = UDim.new(1,0)
+Instance.new("UIStroke",  expSliderBg).Color        = COLORS.border
 
 expSliderFill = Instance.new("Frame", expSliderBg)
-expSliderFill.Size            = UDim2.new(0.5, 0, 1, 0)
+expSliderFill.Size             = UDim2.new(0.5,0,1,0)
 expSliderFill.BackgroundColor3 = COLORS.accent
-expSliderFill.BorderSizePixel = 0
-Instance.new("UICorner", expSliderFill).CornerRadius = UDim.new(1, 0)
+expSliderFill.BorderSizePixel  = 0
+Instance.new("UICorner", expSliderFill).CornerRadius = UDim.new(1,0)
 
 expSliderBtn = Instance.new("TextButton", expSliderBg)
-expSliderBtn.Size            = UDim2.fromOffset(14, 14)
-expSliderBtn.AnchorPoint     = Vector2.new(0.5, 0.5)
-expSliderBtn.Position        = UDim2.new(0.5, 0, 0.5, 0)
-expSliderBtn.BackgroundColor3 = Color3.new(1, 1, 1)
-expSliderBtn.AutoButtonColor = false
-expSliderBtn.Text            = ""
-expSliderBtn.BorderSizePixel = 0
-Instance.new("UICorner", expSliderBtn).CornerRadius = UDim.new(1, 0)
+expSliderBtn.Size             = UDim2.fromOffset(14,14)
+expSliderBtn.AnchorPoint      = Vector2.new(0.5,0.5)
+expSliderBtn.Position         = UDim2.new(0.5,0,0.5,0)
+expSliderBtn.BackgroundColor3 = Color3.new(1,1,1)
+expSliderBtn.AutoButtonColor  = false
+expSliderBtn.Text             = ""
+expSliderBtn.BorderSizePixel  = 0
+Instance.new("UICorner", expSliderBtn).CornerRadius = UDim.new(1,0)
 
--- ── Button row ───────────────────────────────
+-- Button row
 local btnRow = Instance.new("Frame", expandedFrame)
 btnRow.LayoutOrder            = 7
-btnRow.Size                   = UDim2.new(1, 0, 0, 32)
+btnRow.Size                   = UDim2.new(1,0,0,32)
 btnRow.BackgroundTransparency = 1
 
 local btnList = Instance.new("UIListLayout", btnRow)
@@ -1733,69 +937,75 @@ btnList.FillDirection       = Enum.FillDirection.Horizontal
 btnList.HorizontalAlignment = Enum.HorizontalAlignment.Left
 btnList.VerticalAlignment   = Enum.VerticalAlignment.Center
 btnList.SortOrder           = Enum.SortOrder.LayoutOrder
-btnList.Padding             = UDim.new(0, 8)
-
--- forward-declare showCurrent used in callbacks
-local showCurrent
+btnList.Padding             = UDim.new(0,8)
 
 local resetBtn = island:CreateButton({
-    Name = "Reset", Text = "↺ รีเซ็ต", TextSize = 12,
-    Size = UDim2.fromOffset(80, 32), LayoutOrder = 1,
-    BackgroundColor3 = COLORS.rst_bg, TextColor3 = COLORS.rst_txt,
-    CornerRadius = UDim.new(0, 10), Parent = btnRow,
-    Callback = function()
+    Name="Reset", Text="↺ รีเซ็ต", TextSize=12,
+    Size=UDim2.fromOffset(74,32), LayoutOrder=1,
+    BackgroundColor3=COLORS.rst_bg, TextColor3=COLORS.rst_txt,
+    CornerRadius=UDim.new(0,10), Parent=btnRow,
+    Callback=function()
         blacklisted = {}
         if lastWord ~= "" and lastWord ~= "__none__" then
             if refreshSuggestions then refreshSuggestions(lastWord) end
-        else
-            currentSuggestions, currentIndex = {}, 1
-            if showCurrent then showCurrent() end
-        end
+        else currentSuggestions, currentIndex = {}, 1; if showCurrent then showCurrent() end end
     end,
 })
 
 local removeBtn = island:CreateButton({
-    Name = "Remove", Text = "✕ ข้าม", TextSize = 12,
-    Size = UDim2.fromOffset(80, 32), LayoutOrder = 2,
-    BackgroundColor3 = COLORS.del_bg, TextColor3 = COLORS.del_txt,
-    CornerRadius = UDim.new(0, 10), Parent = btnRow,
-    Callback = function()
+    Name="Remove", Text="✕ ข้าม", TextSize=12,
+    Size=UDim2.fromOffset(74,32), LayoutOrder=2,
+    BackgroundColor3=COLORS.del_bg, TextColor3=COLORS.del_txt,
+    CornerRadius=UDim.new(0,10), Parent=btnRow,
+    Callback=function()
         local word = currentSuggestions[currentIndex]
-        if word then
-            blacklisted[word] = true
-            if refreshSuggestions then refreshSuggestions(lastWord) end
-        end
+        if word then blacklisted[word] = true; if refreshSuggestions then refreshSuggestions(lastWord) end end
     end,
 })
 
 expAutoBtn = island:CreateButton({
-    Name = "Auto", Text = "A Auto", TextSize = 12,
-    Size = UDim2.fromOffset(82, 32), LayoutOrder = 3,
-    BackgroundColor3 = COLORS.set_bg, TextColor3 = COLORS.set_txt,
-    CornerRadius = UDim.new(0, 10), Parent = btnRow,
-    Callback = function()
+    Name="Auto", Text="◉ Auto", TextSize=12,
+    Size=UDim2.fromOffset(74,32), LayoutOrder=3,
+    BackgroundColor3=COLORS.auto_on,
+    TextColor3=Color3.new(1,1,1),
+    CornerRadius=UDim.new(0,10), Parent=btnRow,
+    Callback=function()
         isAutoFillON = not isAutoFillON
         if isAutoFillON then
-            TweenService:Create(expAutoBtn, TweenInfo.new(0.2), {BackgroundColor3 = COLORS.auto_on}):Play()
-            expAutoBtn.TextColor3 = Color3.new(1, 1, 1)
-            expAutoBtn.Text = "◉ Auto"
+            TweenService:Create(expAutoBtn,TweenInfo.new(0.2),{BackgroundColor3=COLORS.auto_on}):Play()
+            expAutoBtn.TextColor3 = Color3.new(1,1,1); expAutoBtn.Text = "◉ Auto"
         else
-            TweenService:Create(expAutoBtn, TweenInfo.new(0.2), {BackgroundColor3 = COLORS.set_bg}):Play()
-            expAutoBtn.TextColor3 = COLORS.set_txt
-            expAutoBtn.Text = "A Auto"
+            TweenService:Create(expAutoBtn,TweenInfo.new(0.2),{BackgroundColor3=COLORS.set_bg}):Play()
+            expAutoBtn.TextColor3 = COLORS.set_txt; expAutoBtn.Text = "A Auto"
         end
         if showCurrent then showCurrent() end
     end,
 })
 
--- Register expanded content
-island:SetExpandedContent(expandedFrame, UDim2.fromOffset(310, 228))
+expRankBtn = island:CreateButton({
+    Name="Rank", Text="♟ แรงค์", TextSize=12,
+    Size=UDim2.fromOffset(74,32), LayoutOrder=4,
+    BackgroundColor3=COLORS.rank_on,
+    TextColor3=COLORS.rank_txt,
+    CornerRadius=UDim.new(0,10), Parent=btnRow,
+    Callback=function()
+        CFG.AUTO_RANK = not CFG.AUTO_RANK
+        if CFG.AUTO_RANK then
+            TweenService:Create(expRankBtn,TweenInfo.new(0.2),{BackgroundColor3=COLORS.rank_on}):Play()
+            expRankBtn.TextColor3 = COLORS.rank_txt; expRankBtn.Text = "♟ แรงค์"
+        else
+            TweenService:Create(expRankBtn,TweenInfo.new(0.2),{BackgroundColor3=COLORS.set_bg}):Play()
+            expRankBtn.TextColor3 = COLORS.set_txt; expRankBtn.Text = "♙ แรงค์"
+        end
+    end,
+})
 
--- Initial compact slots
+island:SetExpandedContent(expandedFrame, UDim2.fromOffset(310, 248))
+
 island:SetCompactContent({
-    LeftText      = "W",
-    LeftTextColor = COLORS.accent,
-    RightText     = "รอคำจากเกม...",
+    LeftText       = "W",
+    LeftTextColor  = COLORS.accent,
+    RightText      = "รอคำจากเกม...",
     RightTextColor = COLORS.dim,
 })
 island:SetMinimalContent({ Text = "W" })
@@ -1808,8 +1018,8 @@ local function updateSliderPos(val)
         (val - CFG.TYPING_SPEED_MIN) / (CFG.TYPING_SPEED_MAX - CFG.TYPING_SPEED_MIN),
         0, 1
     )
-    expSliderFill.Size     = UDim2.new(alpha, 0, 1, 0)
-    expSliderBtn.Position  = UDim2.new(alpha, 0, 0.5, 0)
+    expSliderFill.Size    = UDim2.new(alpha, 0, 1, 0)
+    expSliderBtn.Position = UDim2.new(alpha, 0, 0.5, 0)
 end
 
 local function updateSpeedLabel()
@@ -1831,46 +1041,39 @@ UIS.InputChanged:Connect(function(input)
     if not isDraggingSlider then return end
     if input.UserInputType ~= Enum.UserInputType.MouseMovement
         and input.UserInputType ~= Enum.UserInputType.Touch then return end
-    local mouseX   = input.Position.X
-    local absX     = expSliderBg.AbsolutePosition.X
-    local absW     = expSliderBg.AbsoluteSize.X
-    local alpha    = math.clamp((mouseX - absX) / absW, 0, 1)
-    CURRENT_SPEED_DELAY = CFG.TYPING_SPEED_MIN
-        + alpha * (CFG.TYPING_SPEED_MAX - CFG.TYPING_SPEED_MIN)
+    local mouseX = input.Position.X
+    local absX   = expSliderBg.AbsolutePosition.X
+    local absW   = expSliderBg.AbsoluteSize.X
+    local alpha  = math.clamp((mouseX - absX) / absW, 0, 1)
+    CURRENT_SPEED_DELAY = CFG.TYPING_SPEED_MIN + alpha * (CFG.TYPING_SPEED_MAX - CFG.TYPING_SPEED_MIN)
     updateSliderPos(CURRENT_SPEED_DELAY)
     updateSpeedLabel()
 end)
 
--- set initial slider pos
 updateSliderPos(CURRENT_SPEED_DELAY)
 
 -- ════════════════════════════════════════════
 --  UI UPDATE FUNCTIONS
 -- ════════════════════════════════════════════
-
--- Compact pill right slot helper
 local function setCompactRight(text, color)
     island:SetRightText(text, color or COLORS.text)
 end
 
--- Full UI refresh (compact + expanded content)
 showCurrent = function()
     local word    = currentSuggestions[currentIndex]
     local hasWord = lastWord ~= "" and lastWord ~= "__none__"
 
     if hasWord then
         expSubtitle.Text = "ต่อจาก " .. lastWord .. "  ·  ใช้แล้ว " .. usedCount
-
         if word then
-            expWord.Text      = word
+            expWord.Text       = word
             expWord.TextColor3 = COLORS.text
-
             if isAutoFillON then
-                expHint.Text      = "[Auto Mode]"
+                expHint.Text       = "[Auto Mode]"
                 expHint.TextColor3 = COLORS.auto_txt
                 setCompactRight("⟢ " .. word, COLORS.auto_txt)
             else
-                expHint.Text      = "[Tab] พิมพ์คำนี้"
+                expHint.Text       = "[Tab] พิมพ์คำนี้"
                 expHint.TextColor3 = COLORS.dim
                 setCompactRight(word, COLORS.text)
             end
@@ -1879,9 +1082,7 @@ showCurrent = function()
             expWord.TextColor3 = COLORS.dim
             expHint.Text       = ""
             setCompactRight("ไม่มีคำ", COLORS.dim)
-            -- reset any stuck typing state
-            isTyping = false
-            currentTypeCycle = currentTypeCycle + 1
+            isTyping = false; currentTypeCycle = currentTypeCycle + 1
         end
     else
         expSubtitle.Text   = "สถานะ"
@@ -1889,8 +1090,7 @@ showCurrent = function()
         expWord.TextColor3 = COLORS.dim
         expHint.Text       = ""
         setCompactRight("รอคำ...", COLORS.dim)
-        isTyping = false
-        currentTypeCycle = currentTypeCycle + 1
+        isTyping = false; currentTypeCycle = currentTypeCycle + 1
     end
 end
 
@@ -1901,7 +1101,7 @@ refreshSuggestions = function(prefix)
 end
 
 -- ════════════════════════════════════════════
---  INPUT BOX  (identical path to v3.8)
+--  INPUT BOX
 -- ════════════════════════════════════════════
 local function getInputBox()
     local gameUI = LP.PlayerGui:FindFirstChild("GameUI")
@@ -1913,7 +1113,7 @@ local function getInputBox()
     if not (wBox and wBox:IsA("TextBox")) then return nil end
     local pLbl  = bar:FindFirstChild("PrefixLabel")
     local pText = (pLbl and pLbl:IsA("TextLabel")) and pLbl.Text or ""
-    pText = pText:gsub("<[^>]*>", ""):gsub("%s+", "")
+    pText = pText:gsub("<[^>]*>",""):gsub("%s+","")
     return wBox, pText
 end
 
@@ -1924,8 +1124,7 @@ local function getTimerValue()
     local v = math.huge
     pcall(function()
         v = tonumber(
-            LP.PlayerGui
-                :FindFirstChild("GameUI")
+            LP.PlayerGui:FindFirstChild("GameUI")
                 :FindFirstChild("Root")
                 :FindFirstChild("Match")
                 :FindFirstChild("Timer")
@@ -1938,82 +1137,29 @@ end
 
 -- ════════════════════════════════════════════
 --  TYPING PROFILE SELECTOR
---  อ่าน timer ทุก character แล้วเลือก profile ที่เนียนที่สุด
---  t         : วินาทีที่เหลือ (math.huge = ไม่มี timer)
---  charsLeft : จำนวนตัวอักษรที่ยังไม่ได้พิมพ์ (รวม current)
 -- ════════════════════════════════════════════
 local function typingProfile(t, charsLeft)
     local budget = (t - 0.38) / math.max(charsLeft, 1)
-
-    -- TIER 1: ผ่อนคลาย — human สมบูรณ์
     if t == math.huge or t > 8 then
-        return {
-            instant = false,
-            burst   = 18,
-            pause   = 7,
-            lo      = CFG.TYPING_SPEED_MIN,
-            hi      = CFG.TYPING_SPEED_MAX,
-            jlo     = -35, jhi = 65,
-            endSlow = true,
-            hesLo   = 80,  hesHi = 160,
-        }
+        return { instant=false, burst=18, pause=7, lo=CFG.TYPING_SPEED_MIN, hi=CFG.TYPING_SPEED_MAX, jlo=-35, jhi=65, endSlow=true, hesLo=80, hesHi=160 }
     end
-
-    -- TIER 2: สบาย — เกือบเท่า TIER 1
     if t > 5 then
-        local hi = math.min(CFG.TYPING_SPEED_MAX,
-            math.max(budget * 0.9, CFG.TYPING_SPEED_MIN + 0.012))
-        return {
-            instant = false,
-            burst   = 24,
-            pause   = 4,
-            lo      = CFG.TYPING_SPEED_MIN,
-            hi      = hi,
-            jlo     = -28, jhi = 50,
-            endSlow = true,
-            hesLo   = 55,  hesHi = 120,
-        }
+        local hi = math.min(CFG.TYPING_SPEED_MAX, math.max(budget*0.9, CFG.TYPING_SPEED_MIN+0.012))
+        return { instant=false, burst=24, pause=4, lo=CFG.TYPING_SPEED_MIN, hi=hi, jlo=-28, jhi=50, endSlow=true, hesLo=55, hesHi=120 }
     end
-
-    -- TIER 3: กดดันกลาง — ตัด micro-pause, เร็วขึ้น
     if t > 3 then
-        local hi = math.min(CFG.TYPING_SPEED_MAX * 0.65,
-            math.max(budget * 0.88, CFG.TYPING_SPEED_MIN + 0.010))
-        return {
-            instant = false,
-            burst   = 38,
-            pause   = 0,
-            lo      = CFG.TYPING_SPEED_MIN,
-            hi      = hi,
-            jlo     = -15, jhi = 28,
-            endSlow = false,
-            hesLo   = 15,  hesHi = 45,
-        }
+        local hi = math.min(CFG.TYPING_SPEED_MAX*0.65, math.max(budget*0.88, CFG.TYPING_SPEED_MIN+0.010))
+        return { instant=false, burst=38, pause=0, lo=CFG.TYPING_SPEED_MIN, hi=hi, jlo=-15, jhi=28, endSlow=false, hesLo=15, hesHi=45 }
     end
-
-    -- TIER 4: กดดันสูง — burst dominant, jitter น้อย
     if t > 1.2 then
-        local lo = math.max(0.010, budget * 0.75)
-        local hi = math.max(lo + 0.008, budget * 0.96)
-        return {
-            instant = hi < CFG.TYPING_SPEED_MIN,
-            burst   = 62,
-            pause   = 0,
-            lo      = lo,
-            hi      = hi,
-            jlo     = -5, jhi = 10,
-            endSlow = false,
-            hesLo   = 0,  hesHi = 10,
-        }
+        local lo = math.max(0.010, budget*0.75); local hi = math.max(lo+0.008, budget*0.96)
+        return { instant=hi < CFG.TYPING_SPEED_MIN, burst=62, pause=0, lo=lo, hi=hi, jlo=-5, jhi=10, endSlow=false, hesLo=0, hesHi=10 }
     end
-
-    -- TIER 5: panic — instant
-    return { instant = true }
+    return { instant=true }
 end
 
 -- ════════════════════════════════════════════
---  AUTOFILL SYSTEM  (identical to v3.8 logic)
---  Only visual callbacks mapped to new UI refs
+--  AUTOFILL SYSTEM
 -- ════════════════════════════════════════════
 local function submitBox(wBox)
     if IS_TOUCH then
@@ -2026,155 +1172,89 @@ local function submitBox(wBox)
 end
 
 local function fillBox(wBox, text, instant, cancelled)
-    -- เก็บทั้ง char และ codepoint เพื่อ diacritic check
     local chars, codepoints = {}, {}
     for cp in utf8.codes(text) do
-        codepoints[#codepoints + 1] = cp
-        chars[#chars + 1] = utf8.char(cp)
+        codepoints[#codepoints+1] = cp
+        chars[#chars+1] = utf8.char(cp)
     end
     local n = #chars
-
-    -- pre-check: ถ้าเวลาไม่พอแม้พิมพ์เร็วสุด → instant
     if not instant then
         local t0 = getTimerValue()
-        if t0 ~= math.huge and t0 < (n * 0.016 + 0.42) then
-            instant = true
-        end
+        if t0 ~= math.huge and t0 < (n*0.016 + 0.42) then instant = true end
     end
-
-    -- ── Pre-decide typo position ──────────────────────────────────────
-    -- ทำได้แค่ first attempt (instant = false), คำต้องมีอย่างน้อย 3 ตัว
-    -- และตัวที่จะแกล้งพิมพ์ผิดต้องเป็นพยัญชนะ (ไม่ใช่สระ/วรรณยุกต์)
     local typoAt = -1
     if not instant and n >= 3 then
-        local t0 = getTimerValue()
-        local chance = 0
-        if t0 == math.huge or t0 > 8 then
-            chance = CFG.TYPO_CHANCE_T1
-        elseif t0 > 5 then
-            chance = CFG.TYPO_CHANCE_T2
-        end
+        local t0 = getTimerValue(); local chance = 0
+        if t0 == math.huge or t0 > 8 then chance = CFG.TYPO_CHANCE_T1
+        elseif t0 > 5 then chance = CFG.TYPO_CHANCE_T2 end
         if chance > 0 and math.random(100) <= chance then
-            -- เลือก position 2..n-1 ที่ตัวนั้นไม่ใช่ diacritic
             local candidates = {}
-            for idx = 2, n - 1 do
-                if not THAI_DIACRITICS[codepoints[idx]] then
-                    candidates[#candidates + 1] = idx
-                end
+            for idx = 2, n-1 do
+                if not THAI_DIACRITICS[codepoints[idx]] then candidates[#candidates+1] = idx end
             end
-            if #candidates > 0 then
-                typoAt = candidates[math.random(#candidates)]
-            end
+            if #candidates > 0 then typoAt = candidates[math.random(#candidates)] end
         end
     end
-    -- ─────────────────────────────────────────────────────────────────
-
     wBox.Text = ""
-
-    -- hesitation (อ่าน timer อีกครั้ง)
     if not instant then
         local prof0 = typingProfile(getTimerValue(), n)
-        if prof0.instant then
-            instant = true
-        elseif prof0.hesHi > 0 then
-            task.wait(math.random(prof0.hesLo, prof0.hesHi) / 1000)
-        end
+        if prof0.instant then instant = true
+        elseif prof0.hesHi > 0 then task.wait(math.random(prof0.hesLo, prof0.hesHi)/1000) end
     end
     if cancelled() then return false end
-
     if instant then
         wBox.Text = text
     else
         local buf = ""
         for i, ch in ipairs(chars) do
             if cancelled() then return false end
-
-            buf = buf .. ch
-            wBox.Text = buf
+            buf = buf .. ch; wBox.Text = buf
             if not IS_TOUCH then wBox.CursorPosition = #buf + 1 end
-
-            -- ── Typo injection ────────────────────────────────────────
             if i == typoAt then
-                -- สุ่มตัวผิดจาก pool (ต้องไม่เท่ากับตัวจริง)
                 local wrongChar
-                repeat
-                    wrongChar = TYPO_POOL[math.random(#TYPO_POOL)]
-                until wrongChar ~= ch
-
-                -- พิมพ์ตัวผิดเพิ่มเข้าไป
-                local wrongBuf = buf .. wrongChar
-                wBox.Text = wrongBuf
+                repeat wrongChar = TYPO_POOL[math.random(#TYPO_POOL)] until wrongChar ~= ch
+                local wrongBuf = buf .. wrongChar; wBox.Text = wrongBuf
                 if not IS_TOUCH then wBox.CursorPosition = #wrongBuf + 1 end
-
-                -- รอจนสังเกตว่าพิมพ์ผิด
-                task.wait(math.random(CFG.TYPO_NOTICE_LO, CFG.TYPO_NOTICE_HI) / 1000)
+                task.wait(math.random(CFG.TYPO_NOTICE_LO, CFG.TYPO_NOTICE_HI)/1000)
                 if cancelled() then return false end
-
-                -- ลบตัวผิด (backspace = revert กลับ buf เดิม)
                 wBox.Text = buf
                 if not IS_TOUCH then wBox.CursorPosition = #buf + 1 end
-
-                -- หยุดสั้นก่อนพิมพ์ต่อ
-                task.wait(math.random(CFG.TYPO_FIX_LO, CFG.TYPO_FIX_HI) / 1000)
+                task.wait(math.random(CFG.TYPO_FIX_LO, CFG.TYPO_FIX_HI)/1000)
                 if cancelled() then return false end
             end
-            -- ─────────────────────────────────────────────────────────
-
             if i == n then break end
-
-            -- อ่าน timer ทุก character
             local t    = getTimerValue()
             local left = n - i
             local prof = typingProfile(t, left)
-
-            -- ถ้า tier กลายเป็น instant กลางคำ → dump ส่วนที่เหลือทันที
             if prof.instant then
                 local rest = ""
-                for j = i + 1, n do rest = rest .. chars[j] end
+                for j = i+1, n do rest = rest .. chars[j] end
                 wBox.Text = buf .. rest
-                if not IS_TOUCH then wBox.CursorPosition = n + 1 end
+                if not IS_TOUCH then wBox.CursorPosition = n+1 end
                 break
             end
-
-            -- ── คำนวณ delay ตาม profile ──────────────────────────────
-            local delay
-            local roll = math.random(100)
-
+            local delay; local roll = math.random(100)
             if roll <= prof.burst then
-                -- burst: พิมพ์ติดกันเร็ว
-                delay = math.random(5, 25) / 1000
-
+                delay = math.random(5,25)/1000
             elseif prof.pause > 0 and roll <= prof.burst + prof.pause then
-                -- micro-pause: หยุดคิดกลางคำ (TIER 1-2 เท่านั้น)
-                delay = math.random(180, 420) / 1000
-
+                delay = math.random(180,420)/1000
             else
-                -- ความเร็วปกติของ tier นี้
-                local loMs = math.floor(prof.lo * 1000)
-                local hiMs = math.max(loMs + 1, math.floor(prof.hi * 1000))
-                local base = math.random(loMs, hiMs) / 1000
-                local jit  = math.random(prof.jlo, prof.jhi) / 1000
-                local slow = (prof.endSlow and i >= n - 1) and math.random(10, 40) / 1000 or 0
+                local loMs = math.floor(prof.lo*1000)
+                local hiMs = math.max(loMs+1, math.floor(prof.hi*1000))
+                local base = math.random(loMs, hiMs)/1000
+                local jit  = math.random(prof.jlo, prof.jhi)/1000
+                local slow = (prof.endSlow and i >= n-1) and math.random(10,40)/1000 or 0
                 delay = math.max(0.010, base + jit + slow)
             end
-
-            -- ── Diacritic slow ────────────────────────────────────────
-            -- ตัวถัดไปเป็นสระ / วรรณยุกต์ / การันต์ → ต้องเอื้อมกดแป้นไกลกว่า
-            local nextCp = codepoints[i + 1]
-            if nextCp and THAI_DIACRITICS[nextCp] then
-                delay = delay * CFG.DIACRITIC_MULT
-            end
-            -- ─────────────────────────────────────────────────────────
-
+            local nextCp = codepoints[i+1]
+            if nextCp and THAI_DIACRITICS[nextCp] then delay = delay * CFG.DIACRITIC_MULT end
             task.wait(delay)
         end
     end
-
     wBox.CursorPosition = #wBox.Text + 1
     return true
 end
 
--- Inline status update used by doAutoFill
 local function setStatus(text, color)
     expHint.Text       = text
     expHint.TextColor3 = color or COLORS.dim
@@ -2185,52 +1265,29 @@ local function doAutoFill()
     if isTyping then return end
     local word = currentSuggestions[currentIndex]
     if not word then return end
-
     local wBox, pText = getInputBox()
     if not wBox then return end
-
     local suffix = word
-    if pText ~= "" and word:sub(1, #pText) == pText then
-        suffix = word:sub(#pText + 1)
-    elseif lastWord ~= "" and lastWord ~= "__none__" and word:sub(1, #lastWord) == lastWord then
-        suffix = word:sub(#lastWord + 1)
-    end
+    if pText ~= "" and word:sub(1,#pText) == pText then suffix = word:sub(#pText+1)
+    elseif lastWord ~= "" and lastWord ~= "__none__" and word:sub(1,#lastWord) == lastWord then suffix = word:sub(#lastWord+1) end
     if suffix == "" then return end
-
-    isTyping = true
-    currentTypeCycle = currentTypeCycle + 1
+    isTyping = true; currentTypeCycle = currentTypeCycle + 1
     local myCycle = currentTypeCycle
     local function cancelled() return myCycle ~= currentTypeCycle end
-
     local oldClear, oldNative
     local ok, err = pcall(function()
-        oldClear = wBox.ClearTextOnFocus
-        wBox.ClearTextOnFocus = false
-        if IS_TOUCH and CFG.MOBILE_HIDE_KEYBOARD then
-            oldNative = wBox.ShowNativeInput
-            wBox.ShowNativeInput = false
-        end
-
+        oldClear = wBox.ClearTextOnFocus; wBox.ClearTextOnFocus = false
+        if IS_TOUCH and CFG.MOBILE_HIDE_KEYBOARD then oldNative = wBox.ShowNativeInput; wBox.ShowNativeInput = false end
         wBox:CaptureFocus()
-
-        local submitted  = false
-        local waitBefore = CFG.SUBMIT_DELAY
-
+        local submitted = false; local waitBefore = CFG.SUBMIT_DELAY
         for attempt = 1, CFG.VERIFY_RETRIES + 1 do
             if cancelled() then return end
-            if attempt > 1 then
-                setStatus("⟳ พิมพ์ใหม่ " .. (attempt - 1), COLORS.dim)
-            end
-
+            if attempt > 1 then setStatus("⟳ พิมพ์ใหม่ "..(attempt-1), COLORS.dim) end
             if not fillBox(wBox, suffix, attempt > 1, cancelled) then return end
-
-            task.wait(waitBefore)
-            waitBefore = 0.2
+            task.wait(waitBefore); waitBefore = 0.2
             if cancelled() then return end
             if not wBox:IsFocused() then wBox:CaptureFocus() end
-
             if wBox.Text == suffix then
-                -- IceOverlay check (identical to v3.8)
                 while true do
                     if cancelled() then return end
                     local isFrozen = false
@@ -2240,9 +1297,7 @@ local function doAutoFill()
                         local ice    = root  and root:FindFirstChild("IceOverlay")
                         if ice then
                             local lbl = ice:FindFirstChild("TextLabel")
-                            if lbl and ice.Visible and lbl.Visible then
-                                isFrozen = true
-                            end
+                            if lbl and ice.Visible and lbl.Visible then isFrozen = true end
                         end
                     end)
                     if not isFrozen then break end
@@ -2250,20 +1305,12 @@ local function doAutoFill()
                     setStatus("❄️ ติดน้ำแข็ง รอส่ง...", COLORS.ice)
                     task.wait(0.2)
                 end
-
-                submitBox(wBox)
-                submitted = true
-                break
+                submitBox(wBox); submitted = true; break
             end
         end
-
-        if not submitted and not cancelled() then
-            wBox.Text = ""
-            setStatus("✕ พิมพ์ไม่ตรง", COLORS.del_txt)
-        end
+        if not submitted and not cancelled() then wBox.Text = ""; setStatus("✕ พิมพ์ไม่ตรง", COLORS.del_txt) end
     end)
-    if not ok then warn("[WC_Helper] autofill error: " .. tostring(err)) end
-
+    if not ok then warn("[WC_Helper] autofill error: "..tostring(err)) end
     pcall(function()
         if oldClear  ~= nil then wBox.ClearTextOnFocus = oldClear  end
         if oldNative ~= nil then wBox.ShowNativeInput  = oldNative end
@@ -2276,29 +1323,90 @@ local function checkAutoTrigger(targetWord)
     task.spawn(function()
         local t = getTimerValue()
         local base, extra
-
         if t == math.huge or t > 6 then
-            -- เวลาเยอะ: reaction time ปกติของคน
-            base  = math.random(60, 180) / 100
-            extra = math.random(100) <= 25 and math.random(40, 120) / 100 or 0
+            base  = math.random(60,180)/100; extra = math.random(100) <= 25 and math.random(40,120)/100 or 0
         elseif t > 3.5 then
-            -- กลาง: ตอบสนองเร็วขึ้นนิด
-            base  = math.random(30, 90) / 100
-            extra = math.random(100) <= 15 and math.random(10, 40) / 100 or 0
+            base  = math.random(30,90)/100;  extra = math.random(100) <= 15 and math.random(10,40)/100 or 0
         elseif t > 1.8 then
-            -- กดดัน: ไม่รอแล้ว
-            base  = math.random(6, 22) / 100
-            extra = 0
+            base  = math.random(6,22)/100;   extra = 0
         else
-            -- ตื่นตกใจ: ยิงทันที
-            base  = math.random(2, 8) / 100
-            extra = 0
+            base  = math.random(2,8)/100;    extra = 0
         end
-
         task.wait(base + extra)
         if not isAutoFillON or isTyping then return end
         if lastWord ~= targetWord then return end
         doAutoFill()
+    end)
+end
+
+-- ════════════════════════════════════════════
+--  AUTO RANKED QUEUE
+-- ════════════════════════════════════════════
+local function clickGuiButton(button)
+    local pos = button.AbsolutePosition + button.AbsoluteSize * 0.5
+    VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, true,  game, 0)
+    task.wait(0.07)
+    VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
+end
+
+local function tryQueueRanked()
+    if not CFG.AUTO_RANK then return end
+    task.spawn(function()
+        task.wait(CFG.RANK_QUEUE_DELAY)
+        local gui
+        local deadline = os.clock() + CFG.RANK_FIND_TIMEOUT
+        repeat
+            task.wait(0.3)
+            gui = LP.PlayerGui:FindFirstChild("RankedButton")
+        until gui or os.clock() >= deadline
+
+        if not gui then
+            warn("[WC_Helper] ไม่พบ RankedButton ใน PlayerGui")
+            return
+        end
+
+        local frame = gui:FindFirstChild("Frame")
+        if not frame then return end
+        local btn1 = frame:FindFirstChild("TextButton")
+        if not btn1 then return end
+        local lbl1 = btn1:FindFirstChild("TextLebal")
+        if not (lbl1 and lbl1.Text:find("เล่นแรงค์", 1, true)) then
+            warn("[WC_Helper] ไม่พบข้อความ 'เล่นแรงค์' บน btn1")
+            return
+        end
+
+        island:Notify({
+            Title   = "Auto Ranked",
+            Message = "กำลังกด เล่นแรงค์...",
+            Duration = 2,
+        })
+
+        clickGuiButton(btn1)
+        task.wait(CFG.RANK_MODE_DELAY)
+
+        local f2, f3, btn2, lbl2
+        local deadline2 = os.clock() + 3
+        repeat
+            task.wait(0.2)
+            f2   = frame:FindFirstChild("Frame")
+            f3   = f2 and f2:FindFirstChild("Frame")
+            btn2 = f3 and f3:FindFirstChild("TextButton")
+            lbl2 = btn2 and btn2:FindFirstChild("TextLebal")
+        until (lbl2 and lbl2.Text:find("ดวลเดี่ยว 1v1", 1, true))
+            or os.clock() >= deadline2
+
+        if not (lbl2 and lbl2.Text:find("ดวลเดี่ยว 1v1", 1, true)) then
+            warn("[WC_Helper] ไม่พบปุ่ม 'ดวลเดี่ยว 1v1'")
+            return
+        end
+
+        island:Notify({
+            Title   = "Auto Ranked",
+            Message = "เลือก ดวลเดี่ยว 1v1...",
+            Duration = 2,
+        })
+
+        clickGuiButton(btn2)
     end)
 end
 
@@ -2319,14 +1427,14 @@ UIS.InputBegan:Connect(function(input, _gameProcessed)
 end)
 
 -- ════════════════════════════════════════════
---  SCANNER  (identical to v3.8)
+--  SCANNER
 -- ════════════════════════════════════════════
 local function isValidWord(str)
     if str:match("[%a%d]") then return true end
     for i = 1, #str do
         local b = str:byte(i)
         if b == 0xE0 then
-            local b2 = str:byte(i + 1)
+            local b2 = str:byte(i+1)
             if b2 == 0xB8 or b2 == 0xB9 then return true end
         end
     end
@@ -2334,8 +1442,8 @@ local function isValidWord(str)
 end
 
 local function pathAllowed(path)
-    for _, kw in ipairs(PATH_BLACKLIST) do if path:find(kw, 1, true) then return false end end
-    for _, kw in ipairs(PATH_WHITELIST) do if path:find(kw, 1, true) then return true  end end
+    for _, kw in ipairs(PATH_BLACKLIST) do if path:find(kw,1,true) then return false end end
+    for _, kw in ipairs(PATH_WHITELIST) do if path:find(kw,1,true) then return true  end end
     return false
 end
 
@@ -2343,28 +1451,26 @@ local function extractThaiRuns(text)
     local runs, buf = {}, {}
     local i, n = 1, #text
     while i <= n do
-        local b1, b2, b3 = text:byte(i, i + 2)
-        if b1 == 0xE0 and (b2 == 0xB8 or b2 == 0xB9) and b3 and b3 >= 0x80 and b3 <= 0xBF then
-            buf[#buf + 1] = text:sub(i, i + 2); i = i + 3
+        local b1,b2,b3 = text:byte(i, i+2)
+        if b1==0xE0 and (b2==0xB8 or b2==0xB9) and b3 and b3>=0x80 and b3<=0xBF then
+            buf[#buf+1] = text:sub(i,i+2); i = i+3
         else
-            if #buf > 0 then runs[#runs + 1] = table.concat(buf); buf = {} end
-            i = i + 1
+            if #buf > 0 then runs[#runs+1] = table.concat(buf); buf = {} end
+            i = i+1
         end
     end
-    if #buf > 0 then runs[#runs + 1] = table.concat(buf) end
+    if #buf > 0 then runs[#runs+1] = table.concat(buf) end
     return runs
 end
 
 local function extractWords(text)
-    local words = {}
-    text = text:gsub("<[^>]*>", "")
+    local words = {}; text = text:gsub("<[^>]*>","")
     for line in text:gmatch("[^\n\r]+") do
         if CFG.LOG_STRIP_PREFIX then
-            local after = line:match(".*:%s*(.*)$")
-            if after then line = after end
+            local after = line:match(".*:%s*(.*)$"); if after then line = after end
         end
         for _, run in ipairs(extractThaiRuns(line)) do
-            if utf8Len(run) >= 2 then words[#words + 1] = run end
+            if utf8Len(run) >= 2 then words[#words+1] = run end
         end
     end
     return words
@@ -2373,16 +1479,16 @@ end
 local function isShown(obj)
     local cur = obj
     while cur do
-        if cur:IsA("GuiObject")     and not cur.Visible  then return false end
-        if cur:IsA("LayerCollector") and not cur.Enabled then return false end
+        if cur:IsA("GuiObject")      and not cur.Visible  then return false end
+        if cur:IsA("LayerCollector") and not cur.Enabled  then return false end
         cur = cur.Parent
     end
     return true
 end
 
 local function classifyHistory(path)
-    for _, kw in ipairs(PATH_BLACKLIST)    do if path:find(kw, 1, true) then return nil      end end
-    for _, kw in ipairs(HISTORY_KEYWORDS)  do if path:find(kw, 1, true) then return "unknown" end end
+    for _, kw in ipairs(PATH_BLACKLIST)   do if path:find(kw,1,true) then return nil       end end
+    for _, kw in ipairs(HISTORY_KEYWORDS) do if path:find(kw,1,true) then return "unknown" end end
     return nil
 end
 
@@ -2390,20 +1496,14 @@ local function updateUsedWords(hits)
     if #hits == 0 then
         if CFG.CLEAR_AFTER_EMPTY > 0 and usedCount > 0
             and os.clock() - lastHistorySeen >= CFG.CLEAR_AFTER_EMPTY then
-            usedWords, usedCount = {}, 0
-            return true
+            usedWords, usedCount = {}, 0; return true
         end
         return false
     end
-    lastHistorySeen = os.clock()
-    local changed = false
+    lastHistorySeen = os.clock(); local changed = false
     for _, h in ipairs(hits) do
         for _, w in ipairs(extractWords(h.text)) do
-            if not usedWords[w] then
-                usedWords[w] = h.owner
-                usedCount    = usedCount + 1
-                changed      = true
-            end
+            if not usedWords[w] then usedWords[w] = h.owner; usedCount = usedCount+1; changed = true end
         end
     end
     return changed
@@ -2412,51 +1512,40 @@ end
 local function scanAll()
     local candidates, history = {}, {}
     local myTurn = false
-
     pcall(function()
         local matchUI = LP.PlayerGui:FindFirstChild("GameUI")
-        if matchUI and matchUI:FindFirstChild("Root")
-            and matchUI.Root:FindFirstChild("Match") then
+        if matchUI and matchUI:FindFirstChild("Root") and matchUI.Root:FindFirstChild("Match") then
             local promptBox = matchUI.Root.Match:FindFirstChild("PromptBox")
             local promptLbl = promptBox and promptBox:FindFirstChild("Prompt")
             if promptLbl and promptLbl:IsA("TextLabel")
-                and promptLbl.Text:find("ตาคุณ") and isShown(promptLbl) then
-                myTurn = true
-            end
+                and promptLbl.Text:find("ตาคุณ") and isShown(promptLbl) then myTurn = true end
         end
     end)
-
     local function recurse(root)
         for _, obj in ipairs(root:GetDescendants()) do
-            if (obj:IsA("TextLabel") or obj:IsA("TextBox"))
-                and not obj:IsDescendantOf(screenGui) then
+            if (obj:IsA("TextLabel") or obj:IsA("TextBox")) and not obj:IsDescendantOf(screenGui) then
                 local txt = obj.Text or ""
                 if txt ~= "" then
-                    local path = obj:GetFullName()
-                    local ts   = obj.TextSize or 0
+                    local path = obj:GetFullName(); local ts = obj.TextSize or 0
                     if #txt >= CFG.MIN_LEN and #txt <= CFG.MAX_LEN
-                        and ts >= CFG.MIN_TXTSIZE and isValidWord(txt)
-                        and pathAllowed(path) then
-                        table.insert(candidates, { text = txt, size = ts, path = path })
+                        and ts >= CFG.MIN_TXTSIZE and isValidWord(txt) and pathAllowed(path) then
+                        table.insert(candidates, { text=txt, size=ts, path=path })
                     end
                     if CFG.TRACK_USED then
                         local owner = classifyHistory(path)
                         if owner and (not CFG.HISTORY_VISIBLE_ONLY or isShown(obj)) then
-                            table.insert(history, { text = txt, owner = owner, path = path })
+                            table.insert(history, { text=txt, owner=owner, path=path })
                         end
                     end
                 end
             end
         end
     end
-    recurse(game:GetService("Workspace"))
-    recurse(LP.PlayerGui)
-
+    recurse(game:GetService("Workspace")); recurse(LP.PlayerGui)
     if CFG.TRACK_USED then
         pcall(function()
             local matchUI = LP.PlayerGui:FindFirstChild("GameUI")
-            if matchUI and matchUI:FindFirstChild("Root")
-                and matchUI.Root:FindFirstChild("Match") then
+            if matchUI and matchUI:FindFirstChild("Root") and matchUI.Root:FindFirstChild("Match") then
                 local matchNode = matchUI.Root.Match
                 local inputBar  = matchNode:FindFirstChild("InputBar")
                 if inputBar then
@@ -2464,29 +1553,20 @@ local function scanAll()
                     local wBox  = inputBar:FindFirstChild("WordBox")
                     local pText = (pLbl and pLbl:IsA("TextLabel")) and pLbl.Text or ""
                     local wText = (wBox and wBox:IsA("TextBox"))   and wBox.Text or ""
-                    pText = pText:gsub("<[^>]*>", ""):gsub("%s+", "")
-                    wText = wText:gsub("<[^>]*>", ""):gsub("%s+", "")
-                    if #(pText .. wText) >= 3 then
-                        table.insert(history, {
-                            text  = pText .. wText,
-                            owner = "me",
-                            path  = "Custom_Prefix",
-                        })
+                    pText = pText:gsub("<[^>]*>",""):gsub("%s+","")
+                    wText = wText:gsub("<[^>]*>",""):gsub("%s+","")
+                    if #(pText..wText) >= 3 then
+                        table.insert(history, { text=pText..wText, owner="me", path="Custom_Prefix" })
                     end
                 end
                 local feedback = matchNode:FindFirstChild("Feedback")
                 if feedback and feedback:IsA("TextLabel") and feedback.Text ~= "" then
-                    table.insert(history, {
-                        text  = feedback.Text,
-                        owner = "other",
-                        path  = feedback:GetFullName(),
-                    })
+                    table.insert(history, { text=feedback.Text, owner="other", path=feedback:GetFullName() })
                 end
             end
         end)
     end
-
-    table.sort(candidates, function(a, b) return a.size > b.size end)
+    table.sort(candidates, function(a,b) return a.size > b.size end)
     return candidates, history, myTurn
 end
 
@@ -2497,10 +1577,8 @@ local lastWinHandled = 0
 local WIN_COOLDOWN   = 5
 
 local function findNearestSeat()
-    local char = LP.Character
-    if not char then return nil end
-    local root = char:FindFirstChild("HumanoidRootPart")
-    if not root then return nil end
+    local char = LP.Character; if not char then return nil end
+    local root = char:FindFirstChild("HumanoidRootPart"); if not root then return nil end
     local nearest, minDist = nil, math.huge
     for _, obj in ipairs(workspace:GetDescendants()) do
         if (obj:IsA("Seat") or obj:IsA("VehicleSeat")) and obj.Occupant == nil then
@@ -2512,13 +1590,10 @@ local function findNearestSeat()
 end
 
 local function sitIfNeeded()
-    local char = LP.Character
-    if not char then return end
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    if not hum then return end
+    local char = LP.Character; if not char then return end
+    local hum  = char:FindFirstChildOfClass("Humanoid"); if not hum then return end
     if hum.SeatPart then return end
-    local seat = findNearestSeat()
-    if seat then seat:Sit(hum) end
+    local seat = findNearestSeat(); if seat then seat:Sit(hum) end
 end
 
 task.spawn(function()
@@ -2538,7 +1613,6 @@ task.spawn(function()
         showCurrent()
         task.wait(0.5)
         task.spawn(function()
-            -- กด W+S พร้อมกันสั้นๆ เพื่อ trigger seat
             VIM:SendKeyEvent(true,  Enum.KeyCode.W, false, nil)
             VIM:SendKeyEvent(true,  Enum.KeyCode.S, false, nil)
             task.wait(0.3)
@@ -2547,11 +1621,10 @@ task.spawn(function()
             task.wait(0.1)
             sitIfNeeded()
         end)
+        tryQueueRanked()
     end
 
     lbl:GetPropertyChangedSignal("Text"):Connect(onWin)
-
-    -- กัน case ที่ text set ก่อน visible → watch visible ด้วย
     local watched = banner:IsA("GuiObject") and banner or lbl
     watched:GetPropertyChangedSignal("Visible"):Connect(function()
         if watched.Visible then onWin() end
@@ -2590,13 +1663,12 @@ end)
 --  MAIN LOOP + ISLAND ENTRANCE
 -- ════════════════════════════════════════════
 task.spawn(function()
-    task.wait(0.4)          -- slight startup delay mirrors original slide-in timing
-    island:Show()           -- Hidden → Compact (Back easing, built into DynamicIsland)
+    task.wait(0.4)
+    island:Show()
 end)
 
 task.spawn(function()
     local wasMyTurn = false
-
     while true do
         task.wait(CFG.SCAN_RATE)
         local results, history, isMyTurn = scanAll()
@@ -2605,21 +1677,15 @@ task.spawn(function()
         local wordChanged = false
 
         if top and top.text ~= lastWord then
-            lastWord = top.text
-            refreshSuggestions(top.text)
-            wordChanged = true
+            lastWord = top.text; refreshSuggestions(top.text); wordChanged = true
         elseif not top and lastWord ~= "__none__" then
-            lastWord, currentSuggestions, currentIndex = "__none__", {}, 1
-            showCurrent()
-            wordChanged = true
+            lastWord, currentSuggestions, currentIndex = "__none__", {}, 1; showCurrent(); wordChanged = true
         elseif usedChanged and lastWord ~= "" and lastWord ~= "__none__" then
             refreshSuggestions(lastWord)
         end
 
         if isAutoFillON and isMyTurn and currentSuggestions[1] then
-            if (not wasMyTurn) or wordChanged then
-                checkAutoTrigger(lastWord)
-            end
+            if (not wasMyTurn) or wordChanged then checkAutoTrigger(lastWord) end
         end
 
         wasMyTurn = isMyTurn
