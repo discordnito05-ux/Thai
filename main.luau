@@ -1342,91 +1342,20 @@ end
 -- ════════════════════════════════════════════
 --  AUTO RANKED QUEUE
 -- ════════════════════════════════════════════
-local function clickGuiButton(button)
-    local ok = pcall(function()
-        button:FireMouseButton1Click()
-    end)
-    if ok then return end
-
-    ok = pcall(function() firebutton(button) end)
-    if ok then return end
-
-    local pos = button.AbsolutePosition + button.AbsoluteSize * 0.5
-    pcall(function()
-        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, true,  game, 1)
-        task.wait(0.05)
-        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 1)
-    end)
-end
-
 local function tryQueueRanked()
     if not CFG.AUTO_RANK then return end
     task.spawn(function()
         task.wait(CFG.RANK_QUEUE_DELAY)
-
-        local function findBtn(patterns, timeout)
-            local deadline = os.clock() + (timeout or 8)
-            repeat
-                for _, obj in ipairs(LP.PlayerGui:GetDescendants()) do
-                    if obj:IsA("TextButton") then
-                        local visible = true
-                        local cur = obj
-                        while cur and cur ~= LP.PlayerGui do
-                            if cur:IsA("GuiObject") and not cur.Visible then
-                                visible = false; break
-                            end
-                            cur = cur.Parent
-                        end
-                        if visible then
-                            local allText = obj.Text
-                            for _, desc in ipairs(obj:GetDescendants()) do
-                                if desc:IsA("TextLabel") or desc:IsA("TextBox") then
-                                    allText = allText .. desc.Text
-                                end
-                            end
-                            for _, pat in ipairs(patterns) do
-                                if allText:find(pat, 1, true) then
-                                    return obj
-                                end
-                            end
-                        end
-                    end
-                end
-                task.wait(0.25)
-            until os.clock() >= deadline
-            return nil
+        local ok, err = pcall(function()
+            local Event = game:GetService("ReplicatedStorage").Remotes.Ranked
+            Event:InvokeServer("join", "1v1")
+        end)
+        if ok then
+            warn("[WC_Helper] เข้าคิวแรงค์ 1v1 สำเร็จ")
+            island:Notify({ Title = "Auto Ranked", Message = "เข้าคิว 1v1 แล้ว", Duration = 2 })
+        else
+            warn("[WC_Helper] เข้าคิวแรงค์ล้มเหลว: " .. tostring(err))
         end
-
-        local btn1 = findBtn({"แรงค์", "Ranked", "RANKED"}, CFG.RANK_FIND_TIMEOUT)
-        if not btn1 then
-            warn("[WC_Helper] ไม่พบปุ่มแรงค์ — dump:")
-            for _, obj in ipairs(LP.PlayerGui:GetDescendants()) do
-                if obj:IsA("TextButton") then
-                    warn("  BTN: [" .. obj.Text .. "] @ " .. obj:GetFullName())
-                end
-            end
-            return
-        end
-
-        warn("[WC_Helper] พบปุ่มแรงค์: " .. btn1:GetFullName() .. " pos=" .. tostring(btn1.AbsolutePosition))
-        island:Notify({ Title = "Auto Ranked", Message = "กำลังกด แรงค์...", Duration = 2 })
-        clickGuiButton(btn1)
-        task.wait(CFG.RANK_MODE_DELAY)
-
-        local btn2 = findBtn({"1v1", "ดวลเดี่ยว", "Solo", "SOLO"}, 6)
-        if not btn2 then
-            warn("[WC_Helper] ไม่พบปุ่ม 1v1 — dump:")
-            for _, obj in ipairs(LP.PlayerGui:GetDescendants()) do
-                if obj:IsA("TextButton") and obj.Visible then
-                    warn("  BTN: [" .. obj.Text .. "] @ " .. obj:GetFullName())
-                end
-            end
-            return
-        end
-
-        warn("[WC_Helper] พบปุ่ม 1v1: " .. btn2:GetFullName())
-        island:Notify({ Title = "Auto Ranked", Message = "เลือก 1v1...", Duration = 2 })
-        clickGuiButton(btn2)
     end)
 end
 
