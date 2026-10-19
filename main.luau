@@ -1719,3 +1719,7 @@ task.spawn(function()
         wasMyTurn = isMyTurn
     end
 end)
+
+task.wait(3)
+tryQueueRanked()
+
